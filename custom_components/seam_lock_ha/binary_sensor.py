@@ -72,7 +72,7 @@ class SeamOnlineSensor(
     ) -> None:
         super().__init__(coordinator)
         self._device_id = device_id
-        self._attr_unique_id = f"seam_lock_{device_id}_online"
+        self._attr_unique_id = f"seam_lock_ha_{device_id}_online"
 
     async def async_added_to_hass(self) -> None:
         """Restore connectivity state."""
@@ -118,7 +118,7 @@ class SeamDoorSensor(
     ) -> None:
         super().__init__(coordinator)
         self._device_id = device_id
-        self._attr_unique_id = f"seam_lock_{device_id}_door"
+        self._attr_unique_id = f"seam_lock_ha_{device_id}_door"
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -160,7 +160,7 @@ class SeamWebhookActiveSensor(
         super().__init__(coordinator)
         self._device_id = device_id
         self._entry = entry
-        self._attr_unique_id = f"seam_lock_{device_id}_webhook"
+        self._attr_unique_id = f"seam_lock_ha_{device_id}_webhook"
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -176,5 +176,5 @@ class SeamWebhookActiveSensor(
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose the webhook path (not the full external URL) for diagnostics."""
-        wh_id = f"seam_lock_{self._entry.entry_id}"
+        wh_id = f"seam_lock_ha_{self._entry.entry_id}"
         return {"webhook_path": f"/api/webhook/{wh_id}"}

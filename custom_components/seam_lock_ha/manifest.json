@@ -1,5 +1,5 @@
 {
-  "domain": "seam_lock",
+  "domain": "seam_lock_ha",
   "name": "Seam Smart Lock",
   "codeowners": ["@ajvwhite"],
   "config_flow": true,

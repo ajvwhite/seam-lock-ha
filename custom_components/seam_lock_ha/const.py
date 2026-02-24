@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-DOMAIN = "seam_lock"
+DOMAIN = "seam_lock_ha"
 MANUFACTURER = "Schlage"
 
 # Config / options keys
@@ -24,7 +24,7 @@ PLATFORMS: list[str] = ["lock", "sensor", "binary_sensor"]
 ATTRIBUTION = "Data provided by Seam API"
 
 # HA event bus name fired for each webhook-delivered lock event
-HA_EVENT_SEAM_LOCK = "seam_lock_event"
+HA_EVENT_SEAM_LOCK = "seam_lock_ha_event"
 
 # Maximum age (seconds) of a Svix webhook timestamp before rejection (replay defence)
 WEBHOOK_TIMESTAMP_TOLERANCE = 300

@@ -51,7 +51,7 @@ from .coordinator import SeamLockCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
-_PN_ID_PREFIX = "seam_lock_webhook_"
+_PN_ID_PREFIX = "seam_lock_ha_webhook_"
 
 
 # -- Runtime data (stored on entry.runtime_data) -------------------------------
@@ -74,7 +74,7 @@ type SeamLockConfigEntry = ConfigEntry[SeamLockRuntimeData]
 
 def _webhook_id(entry: ConfigEntry) -> str:
     """Deterministic webhook id derived from the config entry id."""
-    return f"seam_lock_{entry.entry_id}"
+    return f"seam_lock_ha_{entry.entry_id}"
 
 
 def _pn_id(entry: ConfigEntry) -> str:

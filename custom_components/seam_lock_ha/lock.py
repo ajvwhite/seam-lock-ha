@@ -56,7 +56,7 @@ class SeamLock(
         super().__init__(coordinator)
         self._device_id = device_id
         self._device_name = device_name
-        self._attr_unique_id = f"seam_lock_{device_id}"
+        self._attr_unique_id = f"seam_lock_ha_{device_id}"
 
     async def async_added_to_hass(self) -> None:
         """Restore previous state on startup."""

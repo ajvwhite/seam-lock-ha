@@ -69,7 +69,7 @@ class _Base(
         """Initialise the base sensor."""
         super().__init__(coordinator)
         self._device_id = device_id
-        self._attr_unique_id = f"seam_lock_{device_id}_{key}"
+        self._attr_unique_id = f"seam_lock_ha_{device_id}_{key}"
         self._attr_name = name
 
     @property
