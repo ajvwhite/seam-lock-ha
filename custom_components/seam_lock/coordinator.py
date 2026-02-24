@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+import uuid
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from seam import Seam
@@ -121,15 +122,27 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         """
         event_type = payload.get("event_type", "")
         if event_type not in WATCHED_EVENT_TYPES:
+            _LOGGER.debug(
+                "Webhook event_type %r not in watched set, ignoring",
+                event_type,
+            )
             return
 
         device_id = payload.get("device_id")
         if device_id and device_id != self._device_id:
             return
 
-        _LOGGER.debug("Webhook event: %s", event_type)
-
         entry = self._normalise_event(payload)
+
+        _LOGGER.debug(
+            "Processing webhook: type=%s, occurred_at=%s, who=%s, "
+            "method=%s, event_id=%s",
+            event_type,
+            entry["occurred_at"],
+            entry["who"],
+            entry["method_display"],
+            entry["event_id"],
+        )
 
         # -- Fast-patch current data -------------------------------------------
         if event_type == "lock.unlocked":
@@ -138,6 +151,14 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
             self.data.last_unlock_method = entry["method_display"]
             self.data.last_unlock_by = entry["who"]
             self.data.total_unlocks_today += 1
+            _LOGGER.debug(
+                "Patched unlock: time=%s, by=%s, method=%s, "
+                "unlocks_today=%d",
+                self.data.last_unlock_time,
+                self.data.last_unlock_by,
+                self.data.last_unlock_method,
+                self.data.total_unlocks_today,
+            )
 
         elif event_type == "lock.locked":
             self.data.locked = True
@@ -149,13 +170,19 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         elif event_type == "device.disconnected":
             self.data.online = False
 
-        # Prepend to event list (dedup by event_id)
+        # Add to event list (dedup by event_id — _normalise_event guarantees
+        # every event has an event_id, generating a synthetic one if needed)
         existing_ids = {
             e.get("event_id") for e in self.data.events if e.get("event_id")
         }
-        if entry.get("event_id") and entry["event_id"] not in existing_ids:
+        if entry["event_id"] not in existing_ids:
             self.data.events.insert(0, entry)
             self.data.events = self.data.events[: self._event_limit * 2]
+            _LOGGER.debug(
+                "Event added to list (total: %d)", len(self.data.events)
+            )
+        else:
+            _LOGGER.debug("Event %s already in list, skipped", entry["event_id"])
 
         # Fire HA event for automations
         self.hass.bus.async_fire(
@@ -247,7 +274,14 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                 api_events = await self.hass.async_add_executor_job(
                     self._fetch_events
                 )
+                before_count = len(prev.events)
                 prev.events = self._merge_events(prev.events, api_events)
+                _LOGGER.debug(
+                    "Event merge: %d existing + %d API -> %d merged",
+                    before_count,
+                    len(api_events),
+                    len(prev.events),
+                )
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("Could not fetch events: %s", err)
 
@@ -272,10 +306,31 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         access_code_id = raw.get("access_code_id")
         who = self._resolve_who(method_raw, access_code_id)
 
+        # Resolve occurred_at with fallbacks
+        occurred_at = (
+            raw.get("occurred_at")
+            or raw.get("created_at")
+        )
+        if occurred_at is None:
+            # Last resort — use current UTC time so the event is timestamped
+            occurred_at = datetime.now(timezone.utc).isoformat()
+            _LOGGER.debug(
+                "Event missing occurred_at, using current time: %s",
+                occurred_at,
+            )
+
+        # Ensure we always have an event_id for deduplication
+        event_id = raw.get("event_id")
+        if not event_id:
+            event_id = f"wh_{uuid.uuid4().hex[:12]}"
+            _LOGGER.debug(
+                "Event missing event_id, generated synthetic: %s", event_id
+            )
+
         return {
-            "event_id": raw.get("event_id"),
+            "event_id": event_id,
             "event_type": raw.get("event_type", "unknown"),
-            "occurred_at": raw.get("occurred_at"),
+            "occurred_at": occurred_at,
             "method": method_raw,
             "method_display": method_display,
             "access_code_id": access_code_id,
@@ -304,16 +359,37 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         existing: list[dict[str, Any]],
         api_events: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Merge existing (webhook) and API events, deduplicated by event_id."""
-        seen: set[str] = set()
+        """Merge existing (webhook) and API events, deduplicated.
+
+        Deduplication uses two strategies:
+        1. By event_id (primary — exact match)
+        2. By (event_type, occurred_at) (secondary — catches webhook events
+           with synthetic IDs that the API later returns with real IDs)
+        """
+        seen_ids: set[str] = set()
+        seen_signatures: set[tuple[str, str]] = set()
         merged: list[dict[str, Any]] = []
 
+        # Process existing (webhook) events first so they take priority
         for event in [*existing, *api_events]:
-            eid = event.get("event_id")
+            eid = event.get("event_id", "")
+
+            # Skip if we already have this exact event_id
+            if eid and eid in seen_ids:
+                continue
+
+            # Skip if we already have an event with the same type+timestamp
+            # (catches synthetic-ID webhook events matched by real API events)
+            etype = event.get("event_type", "")
+            occurred = event.get("occurred_at", "")
+            sig = (etype, occurred)
+            if etype and occurred and sig in seen_signatures:
+                continue
+
             if eid:
-                if eid in seen:
-                    continue
-                seen.add(eid)
+                seen_ids.add(eid)
+            if etype and occurred:
+                seen_signatures.add(sig)
             merged.append(event)
 
         merged.sort(key=lambda e: e.get("occurred_at") or "", reverse=True)
@@ -394,6 +470,15 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                     pass
 
         data.total_unlocks_today = unlocks_today
+
+        _LOGGER.debug(
+            "Derived summary from %d events: last_unlock_by=%s, "
+            "last_unlock_time=%s, unlocks_today=%d",
+            len(data.events),
+            data.last_unlock_by,
+            data.last_unlock_time,
+            data.total_unlocks_today,
+        )
 
     def get_formatted_history(
         self, limit: int = 10

@@ -231,6 +231,10 @@ def _build_webhook_handler(entry_id: str):
             )
 
         # -- Extract event data ------------------------------------------------
+        # Seam/Svix payloads have varying structures depending on API
+        # version.  We normalise all variants into a flat dict.
+        _LOGGER.debug("Seam webhook raw keys: %s", list(payload.keys()))
+
         event_data = payload.get("data", payload)
         event_type = (
             event_data.get("event_type")
@@ -241,8 +245,35 @@ def _build_webhook_handler(entry_id: str):
             _LOGGER.debug("Seam webhook: no event_type, ignoring")
             return Response(status=200, text="OK")
 
+        # Flatten: some payloads nest device_id/method/etc inside
+        # a further "payload" sub-key within the event data.
+        inner = event_data.get("payload", {})
+        if isinstance(inner, dict):
+            for key in (
+                "device_id",
+                "method",
+                "access_code_id",
+            ):
+                if key not in event_data and key in inner:
+                    event_data[key] = inner[key]
+
+        # Ensure essential fields are present at the top level
         event_data["event_type"] = event_type
-        _LOGGER.info("Seam webhook received: %s", event_type)
+        if "event_id" not in event_data and "event_id" in payload:
+            event_data["event_id"] = payload["event_id"]
+        if "occurred_at" not in event_data:
+            event_data["occurred_at"] = (
+                payload.get("occurred_at")
+                or event_data.get("created_at")
+                or payload.get("created_at")
+            )
+
+        _LOGGER.info(
+            "Seam webhook received: %s (event_id=%s, occurred_at=%s)",
+            event_type,
+            event_data.get("event_id", "MISSING"),
+            event_data.get("occurred_at", "MISSING"),
+        )
 
         # Delegate to coordinator (patches data + schedules reconcile)
         coordinator.handle_webhook_event(event_data)
