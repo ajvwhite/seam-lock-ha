@@ -1,0 +1,41 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Seam API",
+        "description": "Enter your Seam API key from [console.seam.co](https://console.seam.co).\n\nYour Schlage account must already be linked in the Seam Console.",
+        "data": {
+          "api_key": "Seam API Key"
+        }
+      },
+      "select_device": {
+        "title": "Select Lock",
+        "description": "Choose the lock to add. The name from the Seam API will be used as the initial device name in Home Assistant. You can rename it later in Settings > Devices.",
+        "data": {
+          "device_id": "Lock"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to Seam API. Check your API key.",
+      "no_devices": "No locks found. Link your Schlage account in the Seam Console first.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This lock is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Seam Lock Options",
+        "description": "Configure polling and webhook settings. The webhook URL is shown as a persistent notification after setup.",
+        "data": {
+          "poll_interval": "Polling interval (seconds)",
+          "event_limit": "Events to fetch per poll",
+          "webhook_secret": "Webhook secret (whsec_\u2026 from Seam Console)"
+        }
+      }
+    }
+  }
+}
