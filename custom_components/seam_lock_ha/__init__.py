@@ -11,13 +11,9 @@ Supports both polling (fallback) and Seam webhooks (instant updates).
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import hmac
 import json
 import logging
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from aiohttp.web import Request, Response
@@ -45,7 +41,6 @@ from .const import (
     DOMAIN,
     PLATFORMS,
     WATCHED_EVENT_TYPES,
-    WEBHOOK_TIMESTAMP_TOLERANCE,
 )
 from .coordinator import SeamLockCoordinator
 
@@ -211,122 +206,85 @@ def _build_webhook_handler(entry_id: str):
             _LOGGER.warning("Seam webhook: invalid JSON body")
             return Response(status=400, text="Invalid JSON")
 
-        # -- Signature verification (when secret is configured) ----------------
+        # -- Signature verification --------------------------------------------
+        # Use the Seam SDK's built-in SeamWebhook verifier when a secret
+        # is configured.  It handles Svix HMAC-SHA256 + timestamp replay
+        # protection internally and returns a SeamEvent object.
         if secret:
-            svix_id = request.headers.get("svix-id", "")
-            svix_ts = request.headers.get("svix-timestamp", "")
-            svix_sig = request.headers.get("svix-signature", "")
+            try:
+                from seam import SeamWebhook
 
-            if not _verify_svix_signature(
-                raw_body, secret, svix_id, svix_ts, svix_sig
-            ):
+                verifier = SeamWebhook(secret)
+                headers = {k: v for k, v in request.headers.items()}
+                verified_event = verifier.verify(
+                    raw_body.decode("utf-8"), headers
+                )
+                # Build a plain dict from the verified SeamEvent for the
+                # coordinator (which operates on dicts, not SeamEvent objects)
+                payload = {
+                    "event_id": getattr(verified_event, "event_id", None),
+                    "event_type": getattr(verified_event, "event_type", None),
+                    "occurred_at": getattr(verified_event, "occurred_at", None),
+                    "created_at": getattr(verified_event, "created_at", None),
+                    "device_id": getattr(verified_event, "device_id", None),
+                    "method": getattr(verified_event, "method", None),
+                    "access_code_id": getattr(
+                        verified_event, "access_code_id", None
+                    ),
+                }
+                _LOGGER.debug("Seam webhook: SDK signature verified OK")
+            except ImportError:
                 _LOGGER.warning(
-                    "Seam webhook: signature verification FAILED"
+                    "seam SDK not available for verification, "
+                    "falling back to unverified"
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Seam webhook: signature verification FAILED: %s", err
                 )
                 return Response(status=401, text="Invalid signature")
-            _LOGGER.debug("Seam webhook: signature verified")
         else:
             _LOGGER.debug(
                 "Seam webhook: no secret configured, skipping verification"
             )
 
         # -- Extract event data ------------------------------------------------
-        # Seam/Svix payloads have varying structures depending on API
-        # version.  We normalise all variants into a flat dict.
-        _LOGGER.debug("Seam webhook raw keys: %s", list(payload.keys()))
+        # The Seam/Svix webhook body IS the flat event object — confirmed by
+        # SDK source (SeamWebhook.verify passes the body to
+        # SeamEvent.from_dict directly).
+        #
+        # Structure from Seam API docs:
+        #   {
+        #     "event_id": "...",
+        #     "event_type": "lock.unlocked",
+        #     "occurred_at": "2026-02-24T20:00:00.123Z",
+        #     "created_at": "...",
+        #     "device_id": "...",
+        #     "method": "keycode",         // for lock.locked/unlocked
+        #     "access_code_id": "...",      // when code used
+        #     ...
+        #   }
 
-        event_data = payload.get("data", payload)
-        event_type = (
-            event_data.get("event_type")
-            or payload.get("event_type")
-            or payload.get("type", "")
-        )
+        event_type = payload.get("event_type", "")
         if not event_type:
-            _LOGGER.debug("Seam webhook: no event_type, ignoring")
+            _LOGGER.debug("Seam webhook: no event_type found, ignoring")
+            _LOGGER.debug("Seam webhook payload keys: %s", list(payload.keys()))
             return Response(status=200, text="OK")
 
-        # Flatten: some payloads nest device_id/method/etc inside
-        # a further "payload" sub-key within the event data.
-        inner = event_data.get("payload", {})
-        if isinstance(inner, dict):
-            for key in (
-                "device_id",
-                "method",
-                "access_code_id",
-            ):
-                if key not in event_data and key in inner:
-                    event_data[key] = inner[key]
-
-        # Ensure essential fields are present at the top level
-        event_data["event_type"] = event_type
-        if "event_id" not in event_data and "event_id" in payload:
-            event_data["event_id"] = payload["event_id"]
-        if "occurred_at" not in event_data:
-            event_data["occurred_at"] = (
-                payload.get("occurred_at")
-                or event_data.get("created_at")
-                or payload.get("created_at")
-            )
-
         _LOGGER.info(
-            "Seam webhook received: %s (event_id=%s, occurred_at=%s)",
+            "Seam webhook received: type=%s, event_id=%s, device_id=%s, "
+            "occurred_at=%s, method=%s, access_code_id=%s",
             event_type,
-            event_data.get("event_id", "MISSING"),
-            event_data.get("occurred_at", "MISSING"),
+            payload.get("event_id", "MISSING"),
+            payload.get("device_id", "MISSING"),
+            payload.get("occurred_at", "MISSING"),
+            payload.get("method", "NONE"),
+            payload.get("access_code_id", "NONE"),
         )
 
         # Delegate to coordinator (patches data + schedules reconcile)
-        coordinator.handle_webhook_event(event_data)
+        coordinator.handle_webhook_event(payload)
 
         return Response(status=200, text="OK")
 
     return _handle_webhook
-
-
-# -- Svix signature verification -----------------------------------------------
-
-
-def _verify_svix_signature(
-    raw_body: bytes,
-    secret: str,
-    msg_id: str,
-    timestamp: str,
-    signatures: str,
-) -> bool:
-    """Verify a Svix HMAC-SHA256 webhook signature with replay protection."""
-    if not (msg_id and timestamp and signatures):
-        _LOGGER.debug("Svix headers incomplete")
-        return False
-
-    # Timestamp replay protection
-    try:
-        ts_int = int(timestamp)
-        now = int(time.time())
-        if abs(now - ts_int) > WEBHOOK_TIMESTAMP_TOLERANCE:
-            _LOGGER.warning(
-                "Svix timestamp too old/future (%s vs now %s)", ts_int, now
-            )
-            return False
-    except (ValueError, TypeError):
-        _LOGGER.debug("Svix timestamp not a valid integer")
-        return False
-
-    # HMAC verification
-    try:
-        key_b64 = secret.removeprefix("whsec_")
-        key = base64.b64decode(key_b64)
-    except Exception:  # noqa: BLE001
-        _LOGGER.warning("Could not decode webhook secret")
-        return False
-
-    signed_content = f"{msg_id}.{timestamp}.".encode() + raw_body
-    expected = hmac.new(key, signed_content, hashlib.sha256).digest()
-    expected_b64 = base64.b64encode(expected).decode()
-
-    for sig in signatures.split(" "):
-        parts = sig.split(",", 1)
-        if len(parts) == 2 and parts[0] == "v1":
-            if hmac.compare_digest(parts[1], expected_b64):
-                return True
-
-    return False

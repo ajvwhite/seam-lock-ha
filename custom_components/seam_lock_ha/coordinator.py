@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from seam import Seam
@@ -29,6 +29,10 @@ _LOGGER = logging.getLogger(__name__)
 
 # Delay before reconciliation poll after a webhook delivery.
 _RECONCILE_DELAY_SECONDS = 8
+
+# How far back to fetch events from Seam API.
+# The API *requires* `since` or `between` — omitting both causes a 400 error.
+_EVENT_LOOKBACK_DAYS = 7
 
 
 class SeamLockData:
@@ -63,9 +67,9 @@ class SeamLockData:
 
         self.events: list[dict[str, Any]] = []
         self.last_unlock_by: str | None = None
-        self.last_unlock_time: str | None = None
+        self.last_unlock_time: datetime | None = None
         self.last_unlock_method: str | None = None
-        self.last_lock_time: str | None = None
+        self.last_lock_time: datetime | None = None
         self.total_unlocks_today: int = 0
 
         # Access codes cache (id -> display name, never raw PINs)
@@ -130,9 +134,15 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
         device_id = payload.get("device_id")
         if device_id and device_id != self._device_id:
+            _LOGGER.debug(
+                "Webhook device_id %s != ours %s, ignoring",
+                device_id,
+                self._device_id,
+            )
             return
 
         entry = self._normalise_event(payload)
+        occurred_dt = entry["occurred_dt"]
 
         _LOGGER.debug(
             "Processing webhook: type=%s, occurred_at=%s, who=%s, "
@@ -147,7 +157,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         # -- Fast-patch current data -------------------------------------------
         if event_type == "lock.unlocked":
             self.data.locked = False
-            self.data.last_unlock_time = entry["occurred_at"]
+            self.data.last_unlock_time = occurred_dt
             self.data.last_unlock_method = entry["method_display"]
             self.data.last_unlock_by = entry["who"]
             self.data.total_unlocks_today += 1
@@ -162,7 +172,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
         elif event_type == "lock.locked":
             self.data.locked = True
-            self.data.last_lock_time = entry["occurred_at"]
+            self.data.last_lock_time = occurred_dt
 
         elif event_type == "device.connected":
             self.data.online = True
@@ -170,8 +180,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         elif event_type == "device.disconnected":
             self.data.online = False
 
-        # Add to event list (dedup by event_id — _normalise_event guarantees
-        # every event has an event_id, generating a synthetic one if needed)
+        # Add to event list (dedup by event_id)
         existing_ids = {
             e.get("event_id") for e in self.data.events if e.get("event_id")
         }
@@ -182,7 +191,9 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                 "Event added to list (total: %d)", len(self.data.events)
             )
         else:
-            _LOGGER.debug("Event %s already in list, skipped", entry["event_id"])
+            _LOGGER.debug(
+                "Event %s already in list, skipped", entry["event_id"]
+            )
 
         # Fire HA event for automations
         self.hass.bus.async_fire(
@@ -283,7 +294,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                     len(prev.events),
                 )
             except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Could not fetch events: %s", err)
+                _LOGGER.warning("Could not fetch/merge events: %s", err)
 
             # Re-derive summary from the authoritative merged list
             self._derive_summary(prev)
@@ -297,8 +308,41 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
     # -- Helpers ---------------------------------------------------------------
 
+    @staticmethod
+    def _parse_timestamp(value: Any) -> datetime | None:
+        """Parse a timestamp string or datetime into a tz-aware datetime.
+
+        Seam API returns ISO 8601 strings like '2026-02-24T20:00:00.123Z'.
+        The Python SDK passes these through as strings.
+        """
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value
+        if isinstance(value, str):
+            try:
+                clean = value.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(clean)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+            except (ValueError, TypeError):
+                _LOGGER.debug("Could not parse timestamp: %r", value)
+                return None
+        return None
+
     def _normalise_event(self, raw: dict[str, Any]) -> dict[str, Any]:
-        """Create a normalised event dict from a raw API/webhook payload."""
+        """Create a normalised event dict from a raw API/webhook payload.
+
+        Every returned dict is guaranteed to have:
+          - event_id (real or synthetic)
+          - event_type
+          - occurred_at (ISO string for display/serialisation)
+          - occurred_dt (datetime object for comparisons)
+          - method, method_display, access_code_id, who
+        """
         method_raw = raw.get("method")
         method_display = UNLOCK_METHODS.get(
             method_raw, method_raw or "Unknown"
@@ -307,17 +351,17 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         who = self._resolve_who(method_raw, access_code_id)
 
         # Resolve occurred_at with fallbacks
-        occurred_at = (
-            raw.get("occurred_at")
-            or raw.get("created_at")
-        )
-        if occurred_at is None:
-            # Last resort — use current UTC time so the event is timestamped
-            occurred_at = datetime.now(timezone.utc).isoformat()
+        occurred_at_raw = raw.get("occurred_at") or raw.get("created_at")
+        occurred_dt = self._parse_timestamp(occurred_at_raw)
+        if occurred_dt is None:
+            occurred_dt = datetime.now(timezone.utc)
             _LOGGER.debug(
-                "Event missing occurred_at, using current time: %s",
-                occurred_at,
+                "Event missing occurred_at (raw=%r), using current time",
+                occurred_at_raw,
             )
+
+        # ISO string for display / serialisation / dedup signature
+        occurred_at_str = occurred_dt.isoformat()
 
         # Ensure we always have an event_id for deduplication
         event_id = raw.get("event_id")
@@ -330,7 +374,8 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         return {
             "event_id": event_id,
             "event_type": raw.get("event_type", "unknown"),
-            "occurred_at": occurred_at,
+            "occurred_at": occurred_at_str,
+            "occurred_dt": occurred_dt,
             "method": method_raw,
             "method_display": method_display,
             "access_code_id": access_code_id,
@@ -344,7 +389,6 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         if access_code_id and access_code_id in self.data.access_codes:
             return self.data.access_codes[access_code_id]
         if access_code_id:
-            # Truncated ID only -- never the actual code digits
             return f"Code ({access_code_id[:8]})"
         if method_raw == "manual":
             return "Manual (Thumbturn/Key)"
@@ -370,16 +414,12 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         seen_signatures: set[tuple[str, str]] = set()
         merged: list[dict[str, Any]] = []
 
-        # Process existing (webhook) events first so they take priority
         for event in [*existing, *api_events]:
             eid = event.get("event_id", "")
 
-            # Skip if we already have this exact event_id
             if eid and eid in seen_ids:
                 continue
 
-            # Skip if we already have an event with the same type+timestamp
-            # (catches synthetic-ID webhook events matched by real API events)
             etype = event.get("event_type", "")
             occurred = event.get("occurred_at", "")
             sig = (etype, occurred)
@@ -396,7 +436,17 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         return merged[: self._event_limit * 2]
 
     def _fetch_events(self) -> list[dict[str, Any]]:
-        """Fetch lock events from the Seam API (runs in executor)."""
+        """Fetch lock events from the Seam API (runs in executor).
+
+        CRITICAL: The Seam events.list() API *requires* either `since` or
+        `between`.  Omitting both causes a 400/422 error that was silently
+        swallowed in previous versions, resulting in zero events returned.
+        """
+        since_dt = datetime.now(timezone.utc) - timedelta(
+            days=_EVENT_LOOKBACK_DAYS
+        )
+        since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
         raw: list[Any] = []
 
         for etype in ("lock.unlocked", "lock.locked", "lock.access_denied"):
@@ -404,47 +454,71 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                 evts = self.seam.events.list(
                     device_id=self._device_id,
                     event_type=etype,
+                    since=since_str,
                     limit=self._event_limit,
                 )
                 raw.extend(evts)
-            except Exception:  # noqa: BLE001
-                try:
-                    evts = self.seam.events.list(
-                        device_id=self._device_id,
-                        event_types=[etype],
-                    )
-                    raw.extend(evts)
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.debug(
-                        "Could not fetch %s events: %s", etype, err
-                    )
+                _LOGGER.debug(
+                    "Fetched %d %s events from API", len(evts), etype
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning(
+                    "events.list(event_type=%s, since=%s) failed: %s",
+                    etype,
+                    since_str,
+                    err,
+                )
 
-        return [
-            self._normalise_event(
-                {
-                    "event_id": getattr(ev, "event_id", None),
-                    "event_type": getattr(ev, "event_type", "unknown"),
-                    "occurred_at": getattr(ev, "occurred_at", None),
-                    "method": getattr(ev, "method", None),
-                    "access_code_id": getattr(ev, "access_code_id", None),
-                }
-            )
-            for ev in raw
-        ]
+        _LOGGER.debug(
+            "Total API events fetched: %d (since=%s)", len(raw), since_str
+        )
+
+        normalised: list[dict[str, Any]] = []
+        for ev in raw:
+            try:
+                normalised.append(
+                    self._normalise_event(
+                        {
+                            "event_id": getattr(ev, "event_id", None),
+                            "event_type": getattr(ev, "event_type", "unknown"),
+                            "occurred_at": getattr(ev, "occurred_at", None),
+                            "created_at": getattr(ev, "created_at", None),
+                            "method": getattr(ev, "method", None),
+                            "access_code_id": getattr(
+                                ev, "access_code_id", None
+                            ),
+                        }
+                    )
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Skipping unprocessable event: %s", err)
+
+        return normalised
 
     def _derive_summary(self, data: SeamLockData) -> None:
-        """Recompute summary fields from the authoritative event list."""
-        today = date.today()
+        """Recompute summary fields from the authoritative event list.
+
+        Uses UTC consistently for the 'today' boundary to match Seam
+        event timestamps (which are always in UTC).
+        """
+        now_utc = datetime.now(timezone.utc)
+        today_utc = now_utc.date()
         unlocks_today = 0
         found_unlock = False
         found_lock = False
 
         for event in data.events:
             etype = event.get("event_type", "")
-            occurred = event.get("occurred_at")
+            occurred_dt: datetime | None = event.get("occurred_dt")
+
+            # Fallback: parse from string if occurred_dt missing
+            if occurred_dt is None:
+                occurred_dt = self._parse_timestamp(
+                    event.get("occurred_at")
+                )
 
             if etype == "lock.unlocked" and not found_unlock:
-                data.last_unlock_time = occurred
+                data.last_unlock_time = occurred_dt
                 data.last_unlock_method = event.get(
                     "method_display", "Unknown"
                 )
@@ -452,19 +526,12 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                 found_unlock = True
 
             if etype == "lock.locked" and not found_lock:
-                data.last_lock_time = occurred
+                data.last_lock_time = occurred_dt
                 found_lock = True
 
-            if etype == "lock.unlocked" and occurred:
+            if etype == "lock.unlocked" and occurred_dt is not None:
                 try:
-                    ts = occurred
-                    if isinstance(ts, str):
-                        event_date = datetime.fromisoformat(
-                            ts.replace("Z", "+00:00")
-                        ).date()
-                    else:
-                        event_date = ts.date()
-                    if event_date == today:
+                    if occurred_dt.date() == today_utc:
                         unlocks_today += 1
                 except (ValueError, AttributeError):
                     pass

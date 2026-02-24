@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -179,14 +180,22 @@ class SeamLastUnlockBySensor(_Base):
         d = self.coordinator.data
         if d is None:
             return {}
-        return {"time": d.last_unlock_time, "method": d.last_unlock_method}
+        # Format the datetime as ISO string for the attribute
+        unlock_time = d.last_unlock_time
+        if isinstance(unlock_time, datetime):
+            unlock_time = unlock_time.isoformat()
+        return {"time": unlock_time, "method": d.last_unlock_method}
 
 
 # -- Last Unlock Time ----------------------------------------------------------
 
 
 class SeamLastUnlockTimeSensor(_Base):
-    """Timestamp of the most recent unlock."""
+    """Timestamp of the most recent unlock.
+
+    IMPORTANT: SensorDeviceClass.TIMESTAMP requires native_value to be a
+    datetime object (with timezone info), NOT a string.
+    """
 
     _attr_device_class = SensorDeviceClass.TIMESTAMP
     _attr_icon = "mdi:clock-outline"
@@ -199,7 +208,7 @@ class SeamLastUnlockTimeSensor(_Base):
         )
 
     async def async_added_to_hass(self) -> None:
-        """Restore last unlock time."""
+        """Restore last unlock time from saved state."""
         await super().async_added_to_hass()
         if (last := await self.async_get_last_state()) is not None:
             if self.coordinator.data.last_unlock_time is None and last.state not in (
@@ -207,16 +216,17 @@ class SeamLastUnlockTimeSensor(_Base):
                 "unknown",
                 "unavailable",
             ):
-                self.coordinator.data.last_unlock_time = last.state
+                # Restore: parse the saved ISO string back to datetime
+                restored = SeamLockCoordinator._parse_timestamp(last.state)
+                if restored is not None:
+                    self.coordinator.data.last_unlock_time = restored
 
     @property
-    def native_value(self) -> str | None:
+    def native_value(self) -> datetime | None:
+        """Return a timezone-aware datetime (required by TIMESTAMP class)."""
         if self.coordinator.data is None:
             return None
-        ts = self.coordinator.data.last_unlock_time
-        if ts and isinstance(ts, str) and "+" not in ts and not ts.endswith("Z"):
-            ts += "+00:00"
-        return ts
+        return self.coordinator.data.last_unlock_time
 
 
 # -- Last Unlock Method --------------------------------------------------------
