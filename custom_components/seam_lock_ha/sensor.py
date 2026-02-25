@@ -19,7 +19,15 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import SeamLockConfigEntry
-from .const import ATTRIBUTION, CONF_DEVICE_ID, CONF_DEVICE_NAME, DOMAIN, MANUFACTURER
+from .const import (
+    ACTIVITY_ICONS,
+    ATTRIBUTION,
+    CONF_DEVICE_ID,
+    CONF_DEVICE_NAME,
+    DOMAIN,
+    MANUFACTURER,
+    format_event_description,
+)
 from .coordinator import SeamLockCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -43,6 +51,7 @@ async def async_setup_entry(
             SeamLastUnlockMethodSensor(coordinator, did, dname),
             SeamUnlocksTodaySensor(coordinator, did, dname),
             SeamAccessCodeCountSensor(coordinator, did, dname),
+            SeamLastActivitySensor(coordinator, did, dname),
         ]
     )
 
@@ -319,4 +328,78 @@ class SeamAccessCodeCountSensor(_Base):
         if d and d.access_codes:
             return {"code_names": list(d.access_codes.values())}
         return {}
+
+
+# -- Last Activity (logbook-friendly) -----------------------------------------
+
+
+class SeamLastActivitySensor(_Base):
+    """Human-readable description of the most recent lock activity.
+
+    The HA EventEntity shows "Detected an event" in the logbook's
+    Activity section because the frontend doesn't reliably look up
+    custom component translations for event entities.  This sensor
+    solves the problem by storing the description as its **state**,
+    so the HA logbook naturally shows readable entries such as
+    ``changed to Unlocked by John via Access Code``.
+
+    The sensor reads from ``coordinator.data.events[0]`` — no extra
+    API calls, no extra memory.  It updates on every coordinator
+    refresh (poll or webhook push).  RestoreEntity preserves the
+    last known description across HA restarts.
+    """
+
+    _attr_icon = "mdi:lock-clock"
+
+    def __init__(
+        self, coordinator: SeamLockCoordinator, did: str, dname: str
+    ) -> None:
+        super().__init__(
+            coordinator, did, dname, "last_activity", "Activity"
+        )
+        self._restored_state: str | None = None
+
+    async def async_added_to_hass(self) -> None:
+        """Restore previous activity description."""
+        await super().async_added_to_hass()
+        if (last := await self.async_get_last_state()) is not None:
+            if last.state not in (None, "unknown", "unavailable"):
+                self._restored_state = last.state
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the description of the most recent event."""
+        d = self.coordinator.data
+        if d and d.events:
+            event = d.events[0]
+            return format_event_description(
+                event.get("event_type", ""),
+                event.get("who", ""),
+                event.get("method_display", ""),
+            )
+        # Fall back to restored state until first poll completes
+        return self._restored_state or "No recent activity"
+
+    @property
+    def icon(self) -> str:
+        """Dynamic icon matching the last event type."""
+        d = self.coordinator.data
+        if d and d.events:
+            etype = d.events[0].get("event_type", "")
+            return ACTIVITY_ICONS.get(etype, "mdi:lock-clock")
+        return "mdi:lock-clock"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose structured event data for templates and automations."""
+        d = self.coordinator.data
+        if not d or not d.events:
+            return {}
+        event = d.events[0]
+        return {
+            "event_type": event.get("event_type", ""),
+            "who": event.get("who", ""),
+            "method": event.get("method_display", ""),
+            "occurred_at": event.get("occurred_at", ""),
+        }
 

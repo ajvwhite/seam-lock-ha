@@ -47,7 +47,15 @@ class SeamLockConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 from .coordinator import _create_seam_with_timeout
 
                 seam = _create_seam_with_timeout(api_key)
-                devices = await self.hass.async_add_executor_job(seam.locks.list)
+                try:
+                    devices = await self.hass.async_add_executor_job(seam.locks.list)
+                finally:
+                    # Close the validation client's HTTP session immediately
+                    # to avoid leaking TCP sockets from the connection pool.
+                    try:
+                        seam.client.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
                 if not devices:
                     errors["base"] = "no_devices"

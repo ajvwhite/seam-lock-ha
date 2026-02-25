@@ -26,6 +26,7 @@ from .const import (
     HA_EVENT_SEAM_LOCK,
     UNLOCK_METHODS,
     WATCHED_EVENT_TYPES,
+    format_event_description,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -602,33 +603,14 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         """Return event history formatted for attributes / diagnostics."""
         result: list[dict[str, Any]] = []
         for event in (self.data.events or [])[:limit]:
-            etype = event.get("event_type", "")
-            short = EVENT_TYPE_MAP.get(etype, etype)
-
-            if etype == "lock.unlocked":
-                who = event.get("who", "Unknown")
-                method = event.get("method_display", "Unknown")
-                action = f"Unlocked by {who} via {method}"
-            elif etype == "lock.locked":
-                method = event.get("method_display", "")
-                action = f"Locked via {method}" if method and method != "Unknown" else "Locked"
-            elif etype == "lock.access_denied":
-                action = "Access Denied"
-            elif etype == "device.connected":
-                action = "Back Online"
-            elif etype == "device.disconnected":
-                action = "Became Unavailable"
-            elif etype == "device.low_battery":
-                action = "Battery Low"
-            elif etype == "device.battery_status_changed":
-                action = "Battery Status Changed"
-            else:
-                action = short.replace("_", " ").title() if short else etype
-
             result.append(
                 {
                     "time": event.get("occurred_at"),
-                    "action": action,
+                    "action": format_event_description(
+                        event.get("event_type", ""),
+                        event.get("who", ""),
+                        event.get("method_display", ""),
+                    ),
                     "method": event.get("method_display", ""),
                     "who": event.get("who", ""),
                 }

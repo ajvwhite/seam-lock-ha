@@ -1,7 +1,7 @@
 # Seam Smart Lock — Home Assistant Integration
 
 **Author:** ajvwhite
-**Version:** 2.2.8
+**Version:** 2.2.9
 
 An integration to use Seam to access Smart Locks to expose more comprehensive information. This was initially created to fix limitations in direct manufacturer implementations.
 
@@ -25,8 +25,9 @@ An integration to use Seam to access Smart Locks to expose more comprehensive in
 | Last Unlock Time | `sensor` | Timestamp of last unlock |
 | Last Unlock Method | `sensor` | How the lock was unlocked |
 | Unlocks Today | `sensor` | Daily unlock counter |
+| Activity | `sensor` | Human-readable last event (e.g. "Unlocked by Alex via Access Code") |
 | Registered Access Codes | `sensor` | Count of Seam-managed codes (diagnostic) |
-| Lock Event Log | `sensor` | Full event history in attributes (diagnostic) |
+| Lock Event | `event` | Event timeline for automations (locked/unlocked/access denied/battery/connectivity) |
 | Connectivity | `binary_sensor` | Online/offline status (diagnostic) |
 | Door | `binary_sensor` | Open/closed (if hardware supports it) |
 | Webhook Active | `binary_sensor` | Whether webhook secret is configured (diagnostic) |
@@ -68,7 +69,7 @@ Your HA instance must be reachable from the internet via HTTPS. Options include:
 
 1. After adding the integration, check your **HA notifications** (bell icon) for the webhook URL
 2. Go to [Seam Console → Webhooks](https://console.seam.co) and add the URL
-3. Select event types: `lock.locked`, `lock.unlocked`, `lock.access_denied`, `device.connected`, `device.disconnected`, `device.low_battery`
+3. Select event types: `lock.locked`, `lock.unlocked`, `lock.access_denied`, `device.connected`, `device.disconnected`, `device.low_battery`, `device.battery_status_changed`
 4. Copy the webhook secret (starts with `whsec_`)
 5. In HA: **Settings → Devices & Services → Seam Smart Lock → Configure** — paste the secret
 6. The setup notification will automatically dismiss once the secret is saved
@@ -108,6 +109,24 @@ When code 1234 is used, the integration will show "Alex" as the person who unloc
 - **Access code names only** — the `code_names` attribute on the access code count sensor lists names (e.g., "Alex"), never PINs
 
 ## Automation Examples
+
+### Lock activity notification (recommended)
+
+```yaml
+automation:
+  - alias: "Lock Activity"
+    trigger:
+      - platform: state
+        entity_id: sensor.pantry_door_activity
+    condition:
+      - condition: template
+        value_template: "{{ trigger.to_state.state != trigger.from_state.state }}"
+    action:
+      - service: notify.mobile_app
+        data:
+          title: "Pantry Door"
+          message: "{{ trigger.to_state.state }}"
+```
 
 ### Instant unlock notification
 

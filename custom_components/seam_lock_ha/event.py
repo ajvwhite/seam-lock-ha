@@ -33,52 +33,11 @@ from .const import (
     EVENT_TYPE_MAP,
     EVENT_TYPE_NAMES,
     MANUFACTURER,
+    format_event_description,
 )
 from .coordinator import SeamLockCoordinator
 
 _LOGGER = logging.getLogger(__name__)
-
-
-def _build_description(short_type: str, event: dict[str, Any]) -> str:
-    """Build a concise human-readable description for the event.
-
-    This populates the 'description' attribute so users see useful text
-    at a glance in the entity card / history, rather than a generic label.
-    """
-    who = event.get("who") or ""
-    method = event.get("method_display") or ""
-
-    if short_type == "unlocked":
-        parts: list[str] = ["Unlocked"]
-        if who and who not in ("Unknown",):
-            parts.append(f"by {who}")
-        if method and method not in ("Unknown",):
-            parts.append(f"via {method}")
-        return " ".join(parts)
-
-    if short_type == "locked":
-        if method and method not in ("Unknown",):
-            return f"Locked via {method}"
-        return "Locked"
-
-    if short_type == "access_denied":
-        if method and method not in ("Unknown",):
-            return f"Access denied ({method})"
-        return "Access denied"
-
-    if short_type == "battery_low":
-        return "Battery low"
-
-    if short_type == "battery_changed":
-        return "Battery status changed"
-
-    if short_type == "connected":
-        return "Back online"
-
-    if short_type == "disconnected":
-        return "Became unavailable"
-
-    return short_type.replace("_", " ").title()
 
 
 async def async_setup_entry(
@@ -165,11 +124,16 @@ class SeamLockEventEntity(EventEntity):
     @callback
     def _handle_event(self, event: dict[str, Any]) -> None:
         """Handle a normalised lock event from the coordinator."""
-        short_type = EVENT_TYPE_MAP.get(event.get("event_type", ""))
+        event_type = event.get("event_type", "")
+        short_type = EVENT_TYPE_MAP.get(event_type)
         if short_type is None:
             return
 
-        description = _build_description(short_type, event)
+        description = format_event_description(
+            event_type,
+            event.get("who", ""),
+            event.get("method_display", ""),
+        )
 
         self._trigger_event(
             short_type,
