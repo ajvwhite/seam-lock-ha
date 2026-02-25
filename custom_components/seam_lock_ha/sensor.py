@@ -43,7 +43,6 @@ async def async_setup_entry(
             SeamLastUnlockMethodSensor(coordinator, did, dname),
             SeamUnlocksTodaySensor(coordinator, did, dname),
             SeamAccessCodeCountSensor(coordinator, did, dname),
-            SeamEventLogSensor(coordinator, did, dname),
         ]
     )
 
@@ -321,39 +320,3 @@ class SeamAccessCodeCountSensor(_Base):
             return {"code_names": list(d.access_codes.values())}
         return {}
 
-
-# -- Full Event Log ------------------------------------------------------------
-
-
-class SeamEventLogSensor(_Base):
-    """Complete event history exposed via attributes."""
-
-    _attr_icon = "mdi:history"
-    _attr_entity_category = EntityCategory.DIAGNOSTIC
-
-    def __init__(
-        self, coordinator: SeamLockCoordinator, did: str, dname: str
-    ) -> None:
-        super().__init__(
-            coordinator, did, dname, "event_log", "Lock Event Log"
-        )
-
-    @property
-    def native_value(self) -> str | None:
-        if self.coordinator.data is None:
-            return None
-        return f"{len(self.coordinator.data.events)} events"
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        history = self.coordinator.get_formatted_history(limit=25)
-        attrs: dict[str, Any] = {
-            "events": history,
-            "event_count": len(history),
-        }
-        for i, ev in enumerate(history[:5], 1):
-            attrs[f"event_{i}_time"] = ev.get("time")
-            attrs[f"event_{i}_action"] = ev.get("action")
-            attrs[f"event_{i}_who"] = ev.get("who")
-            attrs[f"event_{i}_method"] = ev.get("method")
-        return attrs

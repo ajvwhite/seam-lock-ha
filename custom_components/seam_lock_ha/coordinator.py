@@ -15,6 +15,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
+from homeassistant.util import dt as dt_util
 
 from .const import (
     DEFAULT_EVENT_LIMIT,
@@ -102,6 +103,19 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
         # Live data -- survives across polls and webhooks
         self.data = SeamLockData()
+
+        # Listeners for EventEntity — called with normalised event dicts
+        self._event_listeners: list[callback] = []
+
+    def register_event_listener(self, listener: callback) -> callback:
+        """Register a listener for lock events. Returns an unsubscribe callback."""
+        self._event_listeners.append(listener)
+
+        @callback
+        def _unsub() -> None:
+            self._event_listeners.remove(listener)
+
+        return _unsub
 
     @property
     def device_id(self) -> str:
@@ -207,6 +221,10 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                 "who": entry["who"],
             },
         )
+
+        # Notify EventEntity listeners
+        for listener in self._event_listeners:
+            listener(entry)
 
         # Push updated data to all entities immediately
         self.async_set_updated_data(self.data)
@@ -498,11 +516,11 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
     def _derive_summary(self, data: SeamLockData) -> None:
         """Recompute summary fields from the authoritative event list.
 
-        Uses UTC consistently for the 'today' boundary to match Seam
-        event timestamps (which are always in UTC).
+        Uses the HA instance's configured timezone for the 'today' boundary
+        so unlocks_today matches the user's local day, not UTC.
         """
-        now_utc = datetime.now(timezone.utc)
-        today_utc = now_utc.date()
+        local_now = dt_util.now()  # HA-configured timezone
+        today_local = local_now.date()
         unlocks_today = 0
         found_unlock = False
         found_lock = False
@@ -531,20 +549,23 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
             if etype == "lock.unlocked" and occurred_dt is not None:
                 try:
-                    if occurred_dt.date() == today_utc:
+                    # Convert event UTC time to local timezone for day match
+                    local_event = occurred_dt.astimezone(local_now.tzinfo)
+                    if local_event.date() == today_local:
                         unlocks_today += 1
-                except (ValueError, AttributeError):
+                except (ValueError, AttributeError, TypeError):
                     pass
 
         data.total_unlocks_today = unlocks_today
 
         _LOGGER.debug(
             "Derived summary from %d events: last_unlock_by=%s, "
-            "last_unlock_time=%s, unlocks_today=%d",
+            "last_unlock_time=%s, unlocks_today=%d (local_date=%s)",
             len(data.events),
             data.last_unlock_by,
             data.last_unlock_time,
             data.total_unlocks_today,
+            today_local,
         )
 
     def get_formatted_history(

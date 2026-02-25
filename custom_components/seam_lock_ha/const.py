@@ -19,7 +19,7 @@ DEFAULT_POLL_INTERVAL_WEBHOOK = 300  # seconds — reconciliation when webhooks 
 DEFAULT_EVENT_LIMIT = 25
 
 # Entity platforms
-PLATFORMS: list[str] = ["lock", "sensor", "binary_sensor"]
+PLATFORMS: list[str] = ["lock", "sensor", "binary_sensor", "event"]
 
 ATTRIBUTION = "Data provided by Seam API"
 
