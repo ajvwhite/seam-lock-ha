@@ -51,3 +51,27 @@ UNLOCK_METHODS: dict[str, str] = {
     "automatic": "Auto-Lock",
     "unknown": "Unknown",
 }
+
+# Map Seam API event_type → short EventEntity event name.
+# These short names must match the event_types list on the EventEntity
+# and the translation keys in strings.json / translations/en.json.
+EVENT_TYPE_MAP: dict[str, str] = {
+    "lock.locked": "locked",
+    "lock.unlocked": "unlocked",
+    "lock.access_denied": "access_denied",
+    "device.connected": "connected",
+    "device.disconnected": "disconnected",
+    "device.low_battery": "battery_low",
+    "device.battery_status_changed": "battery_changed",
+}
+
+# All short event type names (used by EventEntity._attr_event_types)
+EVENT_TYPE_NAMES: list[str] = sorted(EVENT_TYPE_MAP.values())
+
+# Seam event types to also fetch during polling (device-level events).
+# These supplement the lock events already fetched.
+DEVICE_EVENT_TYPES: list[str] = [
+    "device.connected",
+    "device.disconnected",
+    "device.low_battery",
+]

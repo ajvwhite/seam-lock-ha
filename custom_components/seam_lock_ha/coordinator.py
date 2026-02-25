@@ -20,7 +20,9 @@ from homeassistant.util import dt as dt_util
 from .const import (
     DEFAULT_EVENT_LIMIT,
     DEFAULT_POLL_INTERVAL,
+    DEVICE_EVENT_TYPES,
     DOMAIN,
+    EVENT_TYPE_MAP,
     HA_EVENT_SEAM_LOCK,
     UNLOCK_METHODS,
     WATCHED_EVENT_TYPES,
@@ -124,6 +126,12 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
         self.data = SeamLockData()
         self._event_listeners: list[callback] = []
+        # Track which event IDs have been dispatched to listeners so
+        # the polling path can detect genuinely new events.
+        self._dispatched_event_ids: set[str] = set()
+        # Whether the initial seed of known event IDs has been done.
+        # Prevents flooding the timeline with historical events on startup.
+        self._dispatch_seeded: bool = False
 
     def register_event_listener(self, listener: callback) -> CALLBACK_TYPE:
         """Register a listener for lock events.  Returns an unsubscribe cb."""
@@ -166,6 +174,8 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
         # Drop listener references
         self._event_listeners.clear()
+        self._dispatched_event_ids.clear()
+        self._dispatch_seeded = False
 
     # -- Webhook instant-update path -------------------------------------------
 
@@ -205,6 +215,16 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
             self.data.events.insert(0, entry)
             if len(self.data.events) > _MAX_STORED_EVENTS:
                 del self.data.events[_MAX_STORED_EVENTS:]
+
+        # Mark as dispatched so the polling path doesn't re-fire it
+        self._dispatched_event_ids.add(entry["event_id"])
+        # Cap the tracking set to avoid unbounded growth
+        if len(self._dispatched_event_ids) > _MAX_STORED_EVENTS * 2:
+            self._dispatched_event_ids = {
+                e.get("event_id")
+                for e in self.data.events[:_MAX_STORED_EVENTS]
+                if e.get("event_id")
+            }
 
         # Fire HA bus event for automations
         self.hass.bus.async_fire(
@@ -315,6 +335,10 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                     self._fetch_events
                 )
                 prev.events = self._merge_events(prev.events, api_events)
+
+                # Dispatch genuinely new events to listeners (e.g. EventEntity)
+                # so the timeline updates even without webhooks.
+                self._dispatch_new_events(api_events)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("Events fetch failed: %s", err)
 
@@ -339,22 +363,24 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         )
         since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
+        # All event types we want in the timeline
+        all_event_types = [
+            "lock.unlocked", "lock.locked", "lock.access_denied",
+            *DEVICE_EVENT_TYPES,
+        ]
+
         raw: list[Any] = []
         try:
             evts = self.seam.events.list(
                 device_id=self._device_id,
-                event_types=[
-                    "lock.unlocked", "lock.locked", "lock.access_denied",
-                ],
+                event_types=all_event_types,
                 since=since_str,
                 limit=self._event_limit,
             )
             raw.extend(evts)
         except Exception:  # noqa: BLE001
             # Fallback for older SDK versions without event_types (plural)
-            for etype in (
-                "lock.unlocked", "lock.locked", "lock.access_denied",
-            ):
+            for etype in all_event_types:
                 try:
                     evts = self.seam.events.list(
                         device_id=self._device_id,
@@ -390,6 +416,57 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         return normalised
 
     # -- Pure helpers (no I/O) ------------------------------------------------
+
+    @callback
+    def _dispatch_new_events(
+        self, api_events: list[dict[str, Any]]
+    ) -> None:
+        """Dispatch events not yet seen to EventEntity listeners.
+
+        Only fires events whose event_id hasn't been dispatched before
+        (webhook or previous poll).  On the first call with active
+        listeners, seeds the tracking set from ALL known events (both
+        previously stored and just-fetched) without firing — avoids
+        flooding the timeline with historical events at startup.
+        """
+        if not self._event_listeners:
+            return
+
+        # First dispatch with listeners: seed from everything we know
+        # about (self.data.events already merged with api_events by
+        # the caller).  This covers the case where a webhook arrived
+        # between first poll and entity registration.
+        if not self._dispatch_seeded:
+            self._dispatched_event_ids = {
+                e.get("event_id")
+                for e in self.data.events
+                if e.get("event_id")
+            }
+            self._dispatch_seeded = True
+            return
+
+        new_events: list[dict[str, Any]] = []
+        for ev in api_events:
+            eid = ev.get("event_id")
+            if eid and eid not in self._dispatched_event_ids:
+                new_events.append(ev)
+                self._dispatched_event_ids.add(eid)
+
+        # Cap the tracking set
+        if len(self._dispatched_event_ids) > _MAX_STORED_EVENTS * 2:
+            self._dispatched_event_ids = {
+                e.get("event_id")
+                for e in self.data.events[:_MAX_STORED_EVENTS]
+                if e.get("event_id")
+            }
+
+        # Dispatch newest first (api_events are already sorted desc)
+        for ev in new_events:
+            for listener in self._event_listeners:
+                try:
+                    listener(ev)
+                except Exception:  # noqa: BLE001
+                    _LOGGER.debug("Event listener error", exc_info=True)
 
     @staticmethod
     def _parse_timestamp(value: Any) -> datetime | None:
@@ -526,18 +603,34 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         result: list[dict[str, Any]] = []
         for event in (self.data.events or [])[:limit]:
             etype = event.get("event_type", "")
+            short = EVENT_TYPE_MAP.get(etype, etype)
+
             if etype == "lock.unlocked":
-                action = "Unlocked"
+                who = event.get("who", "Unknown")
+                method = event.get("method_display", "Unknown")
+                action = f"Unlocked by {who} via {method}"
             elif etype == "lock.locked":
-                action = "Locked"
-            else:
+                method = event.get("method_display", "")
+                action = f"Locked via {method}" if method and method != "Unknown" else "Locked"
+            elif etype == "lock.access_denied":
                 action = "Access Denied"
+            elif etype == "device.connected":
+                action = "Back Online"
+            elif etype == "device.disconnected":
+                action = "Became Unavailable"
+            elif etype == "device.low_battery":
+                action = "Battery Low"
+            elif etype == "device.battery_status_changed":
+                action = "Battery Status Changed"
+            else:
+                action = short.replace("_", " ").title() if short else etype
+
             result.append(
                 {
                     "time": event.get("occurred_at"),
                     "action": action,
-                    "method": event.get("method_display", "Unknown"),
-                    "who": event.get("who", "Unknown"),
+                    "method": event.get("method_display", ""),
+                    "who": event.get("who", ""),
                 }
             )
         return result

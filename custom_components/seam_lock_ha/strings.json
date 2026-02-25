@@ -37,5 +37,25 @@
         }
       }
     }
+  },
+  "entity": {
+    "event": {
+      "lock_event": {
+        "name": "Lock Event",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "locked": "Locked",
+              "unlocked": "Unlocked",
+              "access_denied": "Access Denied",
+              "battery_low": "Battery Low",
+              "battery_changed": "Battery Status Changed",
+              "connected": "Back Online",
+              "disconnected": "Became Unavailable"
+            }
+          }
+        }
+      }
+    }
   }
 }
