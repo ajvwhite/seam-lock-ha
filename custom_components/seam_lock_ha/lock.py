@@ -7,6 +7,7 @@ from typing import Any
 
 from homeassistant.components.lock import LockEntity
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -107,13 +108,20 @@ class SeamLock(
         if data is None:
             return {}
 
+        def _fmt(val: Any) -> str:
+            if val is None:
+                return "N/A"
+            if hasattr(val, "isoformat"):
+                return val.isoformat()
+            return str(val)
+
         attrs: dict[str, Any] = {
             "online": data.online,
             "battery_level": data.battery_level,
             "last_unlock_by": data.last_unlock_by or "N/A",
-            "last_unlock_time": data.last_unlock_time or "N/A",
+            "last_unlock_time": _fmt(data.last_unlock_time),
             "last_unlock_method": data.last_unlock_method or "N/A",
-            "last_lock_time": data.last_lock_time or "N/A",
+            "last_lock_time": _fmt(data.last_lock_time),
             "unlocks_today": data.total_unlocks_today,
         }
 
@@ -127,20 +135,28 @@ class SeamLock(
 
     async def async_lock(self, **kwargs: Any) -> None:
         """Lock the door."""
-        await self.hass.async_add_executor_job(
-            lambda: self.coordinator.seam.locks.lock_door(
-                device_id=self._device_id
+        try:
+            await self.hass.async_add_executor_job(
+                lambda: self.coordinator.seam.locks.lock_door(
+                    device_id=self._device_id
+                )
             )
-        )
+        except Exception as err:
+            _LOGGER.error("Lock command failed: %s", err)
+            raise HomeAssistantError(f"Failed to lock: {err}") from err
         self.coordinator.data.locked = True
         self.coordinator.async_set_updated_data(self.coordinator.data)
 
     async def async_unlock(self, **kwargs: Any) -> None:
         """Unlock the door."""
-        await self.hass.async_add_executor_job(
-            lambda: self.coordinator.seam.locks.unlock_door(
-                device_id=self._device_id
+        try:
+            await self.hass.async_add_executor_job(
+                lambda: self.coordinator.seam.locks.unlock_door(
+                    device_id=self._device_id
+                )
             )
-        )
+        except Exception as err:
+            _LOGGER.error("Unlock command failed: %s", err)
+            raise HomeAssistantError(f"Failed to unlock: {err}") from err
         self.coordinator.data.locked = False
         self.coordinator.async_set_updated_data(self.coordinator.data)

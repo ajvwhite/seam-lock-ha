@@ -41,6 +41,15 @@ async def async_get_config_entry_diagnostics(
     if hasattr(entry, "runtime_data") and entry.runtime_data:
         runtime = entry.runtime_data
         d = runtime.coordinator.data
+
+        def _fmt_dt(val: Any) -> str | None:
+            """Format datetime to ISO string for JSON serialisation."""
+            if val is None:
+                return None
+            if hasattr(val, "isoformat"):
+                return val.isoformat()
+            return str(val)
+
         result["coordinator"] = {
             "device_name": d.device_name,
             "locked": d.locked,
@@ -49,9 +58,9 @@ async def async_get_config_entry_diagnostics(
             "battery_status": d.battery_status,
             "door_open": d.door_open,
             "last_unlock_by": d.last_unlock_by,
-            "last_unlock_time": d.last_unlock_time,
+            "last_unlock_time": _fmt_dt(d.last_unlock_time),
             "last_unlock_method": d.last_unlock_method,
-            "last_lock_time": d.last_lock_time,
+            "last_lock_time": _fmt_dt(d.last_lock_time),
             "total_unlocks_today": d.total_unlocks_today,
             "access_code_count": len(d.access_codes),
             "event_count": len(d.events),

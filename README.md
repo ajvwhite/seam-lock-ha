@@ -1,7 +1,7 @@
 # Seam Smart Lock — Home Assistant Integration
 
 **Author:** ajvwhite
-**Version:** 2.2.5
+**Version:** 2.2.7
 
 An integration to use Seam to access Smart Locks to expose more comprehensive information. This was initially created to fix limitations in direct manufacturer implementations.
 

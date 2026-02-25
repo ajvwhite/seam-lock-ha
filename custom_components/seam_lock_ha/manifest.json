@@ -10,5 +10,5 @@
   "issue_tracker": "https://github.com/ajvwhite/seam-lock-ha/issues",
   "loggers": ["seam"],
   "requirements": ["seam>=0.24.0"],
-  "version": "2.2.5"
+  "version": "2.2.7"
 }

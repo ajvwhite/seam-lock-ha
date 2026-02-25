@@ -1,19 +1,17 @@
 """Seam Smart Lock integration for Home Assistant.
 
-A integration to use Seam to access Smart Locks to expose more comprehensive
-information, this was initially created to fix limitations in direct
-manufacturer implementations.
-
 Author: ajvwhite
 
 Supports both polling (fallback) and Seam webhooks (instant updates).
+Hardened against webhook flooding and resource exhaustion.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from aiohttp.web import Request, Response
@@ -40,13 +38,20 @@ from .const import (
     DEFAULT_POLL_INTERVAL_WEBHOOK,
     DOMAIN,
     PLATFORMS,
-    WATCHED_EVENT_TYPES,
 )
 from .coordinator import SeamLockCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
 _PN_ID_PREFIX = "seam_lock_ha_webhook_"
+
+# -- Webhook hardening constants -----------------------------------------------
+_MAX_BODY_BYTES = 65_536          # 64 KB (a Seam event is ~1 KB)
+_RATE_LIMIT_MAX = 30              # max events accepted per window
+_RATE_LIMIT_WINDOW = 60           # seconds
+
+# Sentinel: verifier was attempted but import/init failed — don't retry.
+_VERIFIER_FAILED: object = object()
 
 
 # -- Runtime data (stored on entry.runtime_data) -------------------------------
@@ -60,6 +65,67 @@ class SeamLockRuntimeData:
     webhook_secret: str = ""
     webhook_url: str = ""
 
+    # Cached verifier — created once, reused for all requests.
+    # None = not yet attempted, _VERIFIER_FAILED = import/init failed.
+    _verifier: Any = field(default=None, repr=False)
+
+    # Rate limiter state
+    _rate_timestamps: list[float] = field(default_factory=list, repr=False)
+    _rate_limit_warned: bool = field(default=False, repr=False)
+
+    def get_verifier(self) -> Any | None:
+        """Return a cached SeamWebhook verifier (created once).
+
+        Returns ``None`` and caches the failure if the SDK cannot be
+        imported or the verifier cannot be constructed — avoids retrying
+        a doomed import on every webhook.
+        """
+        if self._verifier is _VERIFIER_FAILED:
+            return None
+        if self._verifier is not None:
+            return self._verifier
+        if not self.webhook_secret:
+            return None
+        try:
+            from seam import SeamWebhook
+
+            self._verifier = SeamWebhook(self.webhook_secret)
+            return self._verifier
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning("Could not create SeamWebhook verifier")
+            self._verifier = _VERIFIER_FAILED
+            return None
+
+    def check_rate_limit(self) -> bool:
+        """Return True if within rate limit, False if exceeded.
+
+        Logs a warning on the *first* rejection only; suppresses
+        subsequent warnings until the window resets.
+        """
+        now = time.monotonic()
+        cutoff = now - _RATE_LIMIT_WINDOW
+
+        # Prune old timestamps
+        self._rate_timestamps = [
+            t for t in self._rate_timestamps if t > cutoff
+        ]
+
+        if len(self._rate_timestamps) >= _RATE_LIMIT_MAX:
+            if not self._rate_limit_warned:
+                _LOGGER.warning(
+                    "Seam webhook rate limit exceeded (%d/%ds) — "
+                    "rejecting further requests until window resets",
+                    _RATE_LIMIT_MAX,
+                    _RATE_LIMIT_WINDOW,
+                )
+                self._rate_limit_warned = True
+            return False
+
+        # Under limit — reset warning flag so next burst logs once
+        self._rate_limit_warned = False
+        self._rate_timestamps.append(now)
+        return True
+
 
 type SeamLockConfigEntry = ConfigEntry[SeamLockRuntimeData]
 
@@ -68,17 +134,14 @@ type SeamLockConfigEntry = ConfigEntry[SeamLockRuntimeData]
 
 
 def _webhook_id(entry: ConfigEntry) -> str:
-    """Deterministic webhook id derived from the config entry id."""
     return f"seam_lock_ha_{entry.entry_id}"
 
 
 def _pn_id(entry: ConfigEntry) -> str:
-    """Persistent notification id."""
     return f"{_PN_ID_PREFIX}{entry.entry_id}"
 
 
 def _get_webhook_url(hass: HomeAssistant, wh_id: str) -> str:
-    """Build the full webhook URL from HA's configured external URL."""
     try:
         from homeassistant.helpers.network import get_url
 
@@ -105,7 +168,9 @@ async def async_setup_entry(
     event_limit: int = entry.options.get(CONF_EVENT_LIMIT, DEFAULT_EVENT_LIMIT)
 
     default_interval = (
-        DEFAULT_POLL_INTERVAL_WEBHOOK if webhook_secret else DEFAULT_POLL_INTERVAL
+        DEFAULT_POLL_INTERVAL_WEBHOOK
+        if webhook_secret
+        else DEFAULT_POLL_INTERVAL
     )
     poll_interval: int = entry.options.get(CONF_POLL_INTERVAL, default_interval)
 
@@ -118,7 +183,7 @@ async def async_setup_entry(
     )
     await coordinator.async_config_entry_first_refresh()
 
-    # Register webhook endpoint
+    # Register webhook
     wh_id = _webhook_id(entry)
     webhook_register(
         hass,
@@ -128,16 +193,17 @@ async def async_setup_entry(
         _build_webhook_handler(entry.entry_id),
     )
     webhook_url = _get_webhook_url(hass, wh_id)
-    _LOGGER.info("Seam Lock webhook endpoint: %s", webhook_url)
+    _LOGGER.info("Seam Lock webhook endpoint registered")
 
-    # Store runtime data on the config entry (modern HA pattern)
+    # Store runtime data
     entry.runtime_data = SeamLockRuntimeData(
         coordinator=coordinator,
         webhook_secret=webhook_secret,
         webhook_url=webhook_url,
     )
+    # Pre-warm the verifier (caches success or failure)
+    entry.runtime_data.get_verifier()
 
-    # Persistent notification: show only when secret is NOT configured
     if webhook_secret:
         pn_dismiss(hass, _pn_id(entry))
     else:
@@ -167,16 +233,19 @@ async def async_setup_entry(
 async def async_unload_entry(
     hass: HomeAssistant, entry: SeamLockConfigEntry
 ) -> bool:
-    """Unload a config entry."""
+    """Unload — clean up webhook, timers, and HTTP session."""
     webhook_unregister(hass, _webhook_id(entry))
     pn_dismiss(hass, _pn_id(entry))
+
+    if hasattr(entry, "runtime_data") and entry.runtime_data:
+        entry.runtime_data.coordinator.shutdown()
+
     return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
 
 async def _async_update_listener(
     hass: HomeAssistant, entry: SeamLockConfigEntry
 ) -> None:
-    """Reload the integration when options change."""
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -189,102 +258,77 @@ def _build_webhook_handler(entry_id: str):
     async def _handle_webhook(
         hass: HomeAssistant, webhook_id: str, request: Request
     ) -> Response:
-        # Locate runtime data via the config entry
         entry = hass.config_entries.async_get_entry(entry_id)
         if entry is None or not hasattr(entry, "runtime_data"):
-            return Response(status=404, text="Integration not loaded")
+            return Response(status=404, text="Not loaded")
 
         runtime: SeamLockRuntimeData = entry.runtime_data
         coordinator = runtime.coordinator
-        secret = runtime.webhook_secret
 
-        # -- Parse body --------------------------------------------------------
+        # -- Rate limiting (protect event loop) --------------------------------
+        if not runtime.check_rate_limit():
+            return Response(status=429, text="Rate limited")
+
+        # -- Read body with size limit -----------------------------------------
         try:
-            raw_body = await request.read()
+            raw_body = await request.content.read(_MAX_BODY_BYTES + 1)
+            if len(raw_body) > _MAX_BODY_BYTES:
+                _LOGGER.warning(
+                    "Seam webhook body too large (%d bytes)", len(raw_body)
+                )
+                return Response(status=413, text="Payload too large")
             payload: dict[str, Any] = json.loads(raw_body)
-        except Exception:  # noqa: BLE001
-            _LOGGER.warning("Seam webhook: invalid JSON body")
+        except json.JSONDecodeError:
             return Response(status=400, text="Invalid JSON")
+        except Exception:  # noqa: BLE001
+            return Response(status=400, text="Bad request")
 
-        # -- Signature verification --------------------------------------------
-        # Use the Seam SDK's built-in SeamWebhook verifier when a secret
-        # is configured.  It handles Svix HMAC-SHA256 + timestamp replay
-        # protection internally and returns a SeamEvent object.
-        if secret:
+        # -- Signature verification (cached verifier) --------------------------
+        verifier = runtime.get_verifier()
+        if verifier is not None:
             try:
-                from seam import SeamWebhook
-
-                verifier = SeamWebhook(secret)
-                headers = {k: v for k, v in request.headers.items()}
+                headers = dict(request.headers)
                 verified_event = verifier.verify(
                     raw_body.decode("utf-8"), headers
                 )
-                # Build a plain dict from the verified SeamEvent for the
-                # coordinator (which operates on dicts, not SeamEvent objects)
                 payload = {
                     "event_id": getattr(verified_event, "event_id", None),
-                    "event_type": getattr(verified_event, "event_type", None),
-                    "occurred_at": getattr(verified_event, "occurred_at", None),
-                    "created_at": getattr(verified_event, "created_at", None),
-                    "device_id": getattr(verified_event, "device_id", None),
+                    "event_type": getattr(
+                        verified_event, "event_type", None
+                    ),
+                    "occurred_at": getattr(
+                        verified_event, "occurred_at", None
+                    ),
+                    "created_at": getattr(
+                        verified_event, "created_at", None
+                    ),
+                    "device_id": getattr(
+                        verified_event, "device_id", None
+                    ),
                     "method": getattr(verified_event, "method", None),
                     "access_code_id": getattr(
                         verified_event, "access_code_id", None
                     ),
                 }
-                _LOGGER.debug("Seam webhook: SDK signature verified OK")
-            except ImportError:
-                _LOGGER.warning(
-                    "seam SDK not available for verification, "
-                    "falling back to unverified"
-                )
             except Exception as err:  # noqa: BLE001
-                _LOGGER.warning(
-                    "Seam webhook: signature verification FAILED: %s", err
-                )
+                _LOGGER.debug("Webhook signature failed: %s", err)
                 return Response(status=401, text="Invalid signature")
-        else:
-            _LOGGER.debug(
-                "Seam webhook: no secret configured, skipping verification"
-            )
+        elif runtime.webhook_secret:
+            # Secret configured but verifier init failed permanently
+            return Response(status=500, text="Verifier error")
 
-        # -- Extract event data ------------------------------------------------
-        # The Seam/Svix webhook body IS the flat event object — confirmed by
-        # SDK source (SeamWebhook.verify passes the body to
-        # SeamEvent.from_dict directly).
-        #
-        # Structure from Seam API docs:
-        #   {
-        #     "event_id": "...",
-        #     "event_type": "lock.unlocked",
-        #     "occurred_at": "2026-02-24T20:00:00.123Z",
-        #     "created_at": "...",
-        #     "device_id": "...",
-        #     "method": "keycode",         // for lock.locked/unlocked
-        #     "access_code_id": "...",      // when code used
-        #     ...
-        #   }
-
+        # -- Validate and dispatch ---------------------------------------------
         event_type = payload.get("event_type", "")
         if not event_type:
-            _LOGGER.debug("Seam webhook: no event_type found, ignoring")
-            _LOGGER.debug("Seam webhook payload keys: %s", list(payload.keys()))
             return Response(status=200, text="OK")
 
-        _LOGGER.info(
-            "Seam webhook received: type=%s, event_id=%s, device_id=%s, "
-            "occurred_at=%s, method=%s, access_code_id=%s",
+        _LOGGER.debug(
+            "Webhook: %s event_id=%s",
             event_type,
-            payload.get("event_id", "MISSING"),
-            payload.get("device_id", "MISSING"),
-            payload.get("occurred_at", "MISSING"),
-            payload.get("method", "NONE"),
-            payload.get("access_code_id", "NONE"),
+            payload.get("event_id", "?"),
         )
 
-        # Delegate to coordinator (patches data + schedules reconcile)
         coordinator.handle_webhook_event(payload)
-
         return Response(status=200, text="OK")
 
     return _handle_webhook

@@ -44,9 +44,9 @@ class SeamLockConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             api_key = user_input[CONF_API_KEY]
             try:
-                from seam import Seam
+                from .coordinator import _create_seam_with_timeout
 
-                seam = Seam(api_key=api_key)
+                seam = _create_seam_with_timeout(api_key)
                 devices = await self.hass.async_add_executor_job(seam.locks.list)
 
                 if not devices:

@@ -8,10 +8,10 @@ and timestamp as extra state data.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from homeassistant.components.event import EventDeviceClass, EventEntity
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -46,13 +46,15 @@ class SeamLockEventEntity(EventEntity):
     """Event entity that fires on lock/unlock/access_denied.
 
     The HA UI renders this as a timeline showing each event with its
-    timestamp and type, which is far more useful than a sensor that
-    just says '14 events'.
+    timestamp and type — far more useful than a sensor showing "14 events".
+
+    Availability is tied to the coordinator's last poll success so the
+    entity correctly shows as unavailable if the API is unreachable.
     """
 
     _attr_has_entity_name = True
     _attr_attribution = ATTRIBUTION
-    _attr_device_class = EventDeviceClass.DOORBELL  # closest match — lock icon
+    _attr_device_class = EventDeviceClass.DOORBELL
     _attr_event_types = ["locked", "unlocked", "access_denied"]
     _attr_translation_key = "lock_event"
 
@@ -62,39 +64,55 @@ class SeamLockEventEntity(EventEntity):
         device_id: str,
         device_name: str,
     ) -> None:
-        """Initialise the event entity."""
         self._coordinator = coordinator
         self._device_id = device_id
         self._attr_unique_id = f"seam_lock_ha_{device_id}_event"
         self._attr_name = "Lock Event"
-        self._unsub: callback | None = None
+        self._unsub_event: CALLBACK_TYPE | None = None
+        self._unsub_coordinator: Callable[[], None] | None = None
+
+    @property
+    def available(self) -> bool:
+        """Tie availability to coordinator health."""
+        return self._coordinator.last_update_success
 
     @property
     def device_info(self) -> DeviceInfo:
-        """Link to the parent lock device."""
         return DeviceInfo(
             identifiers={(DOMAIN, self._device_id)},
             manufacturer=MANUFACTURER,
         )
 
     async def async_added_to_hass(self) -> None:
-        """Subscribe to lock events from the coordinator."""
+        """Subscribe to lock events and coordinator updates."""
         await super().async_added_to_hass()
-        self._unsub = self._coordinator.register_event_listener(
+        self._unsub_event = self._coordinator.register_event_listener(
             self._handle_event
+        )
+        # Also listen to coordinator updates so ``available`` refreshes
+        # when the coordinator recovers or fails.
+        self._unsub_coordinator = self._coordinator.async_add_listener(
+            self._handle_coordinator_update
         )
 
     async def async_will_remove_from_hass(self) -> None:
-        """Unsubscribe from lock events."""
-        if self._unsub is not None:
-            self._unsub()
-            self._unsub = None
+        """Unsubscribe from all listeners."""
+        if self._unsub_event is not None:
+            self._unsub_event()
+            self._unsub_event = None
+        if self._unsub_coordinator is not None:
+            self._unsub_coordinator()
+            self._unsub_coordinator = None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Update availability when coordinator state changes."""
+        self.async_write_ha_state()
 
     @callback
     def _handle_event(self, event: dict[str, Any]) -> None:
         """Handle a normalised lock event from the coordinator."""
-        seam_type = event.get("event_type", "")
-        short_type = _EVENT_TYPE_MAP.get(seam_type)
+        short_type = _EVENT_TYPE_MAP.get(event.get("event_type", ""))
         if short_type is None:
             return
 
@@ -107,9 +125,3 @@ class SeamLockEventEntity(EventEntity):
             },
         )
         self.async_write_ha_state()
-        _LOGGER.debug(
-            "Lock event entity fired: %s (who=%s, method=%s)",
-            short_type,
-            event.get("who"),
-            event.get("method_display"),
-        )
