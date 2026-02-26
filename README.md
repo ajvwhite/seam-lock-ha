@@ -1,7 +1,7 @@
 # Seam Smart Lock — Home Assistant Integration
 
 **Author:** ajvwhite
-**Version:** 2.2.11
+**Version:** 2.2.12
 
 An integration to use Seam to access Smart Locks to expose more comprehensive information. This was initially created to fix limitations in direct manufacturer implementations.
 
@@ -78,7 +78,7 @@ When the webhook secret is configured, the polling interval relaxes to 5 minutes
 
 ## Integration Icon / Logo
 
-Custom integrations cannot bundle their own icons for the HA frontend. To see the Seam Lock icon in your Devices & Services page, icons must be submitted to the [home-assistant/brands](https://github.com/home-assistant/brands) repository on GitHub under `custom_integrations/seam_lock_ha/`. See the brands repo README for image specifications.
+Brand images (icon and logo) are bundled in `custom_components/seam_lock_ha/brand/` and are loaded automatically by Home Assistant 2026.3+.
 
 ## Access Code Setup
 
@@ -168,7 +168,6 @@ automation:
 | Webhook URL shows `http://` | Set up HTTPS — Seam requires it |
 | Webhook URL shows `homeassistant.local` | Configure your external URL in HA: Settings → System → Network |
 | Signature verification fails | Ensure the full `whsec_...` string is copied including the prefix |
-| Icon not showing | Submit icons to the [home-assistant/brands](https://github.com/home-assistant/brands) repo |
 
 ## License
 
