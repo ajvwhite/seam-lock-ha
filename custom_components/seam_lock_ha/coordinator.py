@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
-import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -510,7 +510,18 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
         event_id = raw.get("event_id")
         if not event_id:
-            event_id = f"wh_{uuid.uuid4().hex[:12]}"
+            # Deterministic fallback: the same physical event always
+            # produces the same synthetic ID regardless of how many
+            # times it is fetched from the API.  Without this, every
+            # poll generates a new random ID for the same event,
+            # causing _dispatch_new_events to re-fire it as "new".
+            sig = (
+                f"{raw.get('event_type', '')}:"
+                f"{occurred_dt.isoformat()}:"
+                f"{method_raw or ''}:"
+                f"{access_code_id or ''}"
+            )
+            event_id = f"syn_{hashlib.sha256(sig.encode()).hexdigest()[:16]}"
 
         return {
             "event_id": event_id,
