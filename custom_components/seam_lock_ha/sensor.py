@@ -12,7 +12,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -31,6 +31,9 @@ from .const import (
 from .coordinator import SeamLockCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+# Sentinel to detect first update (distinct from any real value including None).
+_SENTINEL = object()
 
 
 async def async_setup_entry(
@@ -62,7 +65,14 @@ async def async_setup_entry(
 class _Base(
     CoordinatorEntity[SeamLockCoordinator], RestoreEntity, SensorEntity
 ):
-    """Base sensor with coordinator binding, state restoration, and device link."""
+    """Base sensor with coordinator binding, state restoration, and device link.
+
+    Overrides the default ``_handle_coordinator_update`` to suppress
+    state writes when the sensor value hasn't actually changed.  On
+    constrained hardware (HA Yellow) this prevents the recorder from
+    writing identical rows to SQLite every poll cycle (~30 s), which
+    is the primary cause of I/O-induced UI freezes.
+    """
 
     _attr_has_entity_name = True
     _attr_attribution = ATTRIBUTION
@@ -80,6 +90,16 @@ class _Base(
         self._device_id = device_id
         self._attr_unique_id = f"seam_lock_ha_{device_id}_{key}"
         self._attr_name = name
+        self._prev_native_value: Any = _SENTINEL
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Only write state when the value has actually changed."""
+        current = self.native_value
+        if current == self._prev_native_value:
+            return
+        self._prev_native_value = current
+        self.async_write_ha_state()
 
     @property
     def device_info(self) -> DeviceInfo:

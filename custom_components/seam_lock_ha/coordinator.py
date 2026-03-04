@@ -71,7 +71,6 @@ class SeamLockData:
         "access_codes",
         "battery_level",
         "battery_status",
-        "device",
         "device_name",
         "door_open",
         "events",
@@ -80,18 +79,19 @@ class SeamLockData:
         "last_unlock_method",
         "last_unlock_time",
         "locked",
+        "model_display_name",
         "online",
         "total_unlocks_today",
     )
 
     def __init__(self) -> None:
-        self.device: Any = None
         self.locked: bool | None = None
         self.online: bool = False
         self.battery_level: float | None = None
         self.battery_status: str | None = None
         self.door_open: bool | None = None
         self.device_name: str = "Seam Lock"
+        self.model_display_name: str | None = None
         self.events: list[dict[str, Any]] = []
         self.last_unlock_by: str | None = None
         self.last_unlock_time: datetime | None = None
@@ -290,7 +290,6 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                 device = await self.hass.async_add_executor_job(
                     self._fetch_device
                 )
-                prev.device = device
                 prev.device_name = (
                     getattr(device, "display_name", None)
                     or prev.device_name
@@ -298,6 +297,13 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                 props = device.properties
                 prev.locked = getattr(props, "locked", prev.locked)
                 prev.online = getattr(props, "online", prev.online)
+
+                # Extract model display name (lightweight string, not SDK object)
+                model_obj = getattr(props, "model", None)
+                if model_obj:
+                    mdname = getattr(model_obj, "display_name", None)
+                    if mdname:
+                        prev.model_display_name = mdname
 
                 battery = getattr(props, "battery", None)
                 if battery:
@@ -313,6 +319,8 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                         prev.battery_level = round(raw * 100, 1)
 
                 prev.door_open = getattr(props, "door_open", prev.door_open)
+                # `device` (full SDK object) goes out of scope here and is
+                # eligible for GC — we only keep primitive values above.
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("Device poll failed: %s", err)
                 raise UpdateFailed(f"Device poll failed: {err}") from err

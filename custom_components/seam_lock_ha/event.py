@@ -82,6 +82,7 @@ class SeamLockEventEntity(EventEntity):
         self._attr_name = "Lock Event"
         self._unsub_event: CALLBACK_TYPE | None = None
         self._unsub_coordinator: Callable[[], None] | None = None
+        self._prev_available: bool | None = None
 
     @property
     def available(self) -> bool:
@@ -118,8 +119,15 @@ class SeamLockEventEntity(EventEntity):
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """Update availability when coordinator state changes."""
-        self.async_write_ha_state()
+        """Update availability when coordinator state changes.
+
+        Only write state when availability has actually toggled to
+        avoid unnecessary recorder writes every poll cycle.
+        """
+        new_avail = self._coordinator.last_update_success
+        if new_avail != self._prev_available:
+            self._prev_available = new_avail
+            self.async_write_ha_state()
 
     @callback
     def _handle_event(self, event: dict[str, Any]) -> None:

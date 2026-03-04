@@ -9,7 +9,7 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
 )
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -25,6 +25,9 @@ from .const import (
     MANUFACTURER,
 )
 from .coordinator import SeamLockCoordinator
+
+# Sentinel to detect first update (distinct from any real value including None).
+_SENTINEL = object()
 
 
 async def async_setup_entry(
@@ -73,6 +76,7 @@ class SeamOnlineSensor(
         super().__init__(coordinator)
         self._device_id = device_id
         self._attr_unique_id = f"seam_lock_ha_{device_id}_online"
+        self._prev_is_on: Any = _SENTINEL
 
     async def async_added_to_hass(self) -> None:
         """Restore connectivity state."""
@@ -80,6 +84,15 @@ class SeamOnlineSensor(
         if (last := await self.async_get_last_state()) is not None:
             if not self.coordinator.data.online:
                 self.coordinator.data.online = last.state == "on"
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Only write state when connectivity actually changes."""
+        current = self.is_on
+        if current == self._prev_is_on:
+            return
+        self._prev_is_on = current
+        self.async_write_ha_state()
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -119,6 +132,16 @@ class SeamDoorSensor(
         super().__init__(coordinator)
         self._device_id = device_id
         self._attr_unique_id = f"seam_lock_ha_{device_id}_door"
+        self._prev_is_on: Any = _SENTINEL
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Only write state when door state actually changes."""
+        current = self.is_on
+        if current == self._prev_is_on:
+            return
+        self._prev_is_on = current
+        self.async_write_ha_state()
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -161,6 +184,16 @@ class SeamWebhookActiveSensor(
         self._device_id = device_id
         self._entry = entry
         self._attr_unique_id = f"seam_lock_ha_{device_id}_webhook"
+        self._prev_is_on: Any = _SENTINEL
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Only write state when webhook status actually changes."""
+        current = self.is_on
+        if current == self._prev_is_on:
+            return
+        self._prev_is_on = current
+        self.async_write_ha_state()
 
     @property
     def device_info(self) -> DeviceInfo:

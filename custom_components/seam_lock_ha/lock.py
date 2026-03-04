@@ -6,7 +6,7 @@ import logging
 from typing import Any
 
 from homeassistant.components.lock import LockEntity
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -58,6 +58,21 @@ class SeamLock(
         self._device_id = device_id
         self._device_name = device_name
         self._attr_unique_id = f"seam_lock_ha_{device_id}"
+        self._prev_state: tuple[bool | None, bool] | None = None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Only write state when lock or availability actually changes.
+
+        Prevents redundant recorder writes every poll cycle on
+        constrained hardware like the HA Yellow.
+        """
+        d = self.coordinator.data
+        current = (d.locked if d else None, self.available)
+        if current == self._prev_state:
+            return
+        self._prev_state = current
+        self.async_write_ha_state()
 
     async def async_added_to_hass(self) -> None:
         """Restore previous state on startup."""
@@ -69,21 +84,16 @@ class SeamLock(
     @property
     def device_info(self) -> DeviceInfo:
         """Return device info for the device registry."""
-        info = DeviceInfo(
+        model = "FE789WB Encode WiFi Lever"
+        if self.coordinator.data and self.coordinator.data.model_display_name:
+            model = self.coordinator.data.model_display_name
+
+        return DeviceInfo(
             identifiers={(DOMAIN, self._device_id)},
             name=self._device_name,
             manufacturer=MANUFACTURER,
-            model="FE789WB Encode WiFi Lever",
+            model=model,
         )
-        if self.coordinator.data and self.coordinator.data.device:
-            model_obj = getattr(
-                self.coordinator.data.device.properties, "model", None
-            )
-            if model_obj:
-                display = getattr(model_obj, "display_name", None)
-                if display:
-                    info["model"] = display
-        return info
 
     @property
     def available(self) -> bool:
