@@ -167,12 +167,14 @@ async def async_setup_entry(
     webhook_secret: str = entry.options.get(CONF_WEBHOOK_SECRET, "")
     event_limit: int = entry.options.get(CONF_EVENT_LIMIT, DEFAULT_EVENT_LIMIT)
 
-    default_interval = (
-        DEFAULT_POLL_INTERVAL_WEBHOOK
-        if webhook_secret
-        else DEFAULT_POLL_INTERVAL
-    )
-    poll_interval: int = entry.options.get(CONF_POLL_INTERVAL, default_interval)
+    poll_interval: int = entry.options.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL)
+
+    # If webhooks are active and the user hasn't customised the interval
+    # away from the non-webhook default, relax to the webhook-aware cadence.
+    # The config flow always seeds poll_interval=30 in options, so without
+    # this override the 300 s webhook default is never used.
+    if webhook_secret and poll_interval == DEFAULT_POLL_INTERVAL:
+        poll_interval = DEFAULT_POLL_INTERVAL_WEBHOOK
 
     coordinator = SeamLockCoordinator(
         hass,
