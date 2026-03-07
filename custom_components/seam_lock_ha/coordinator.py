@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -133,7 +134,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         self._event_limit = min(event_limit, _MAX_STORED_EVENTS)
         self._seam: Seam | None = None
         self._reconcile_unsub: CALLBACK_TYPE | None = None
-        self._poll_in_progress = False
+        self._poll_lock = threading.Lock()
 
         self.data = SeamLockData()
         self._event_listeners: list[callback] = []
@@ -284,123 +285,139 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
         All synchronous Seam API calls run inside a **single** executor
         job (``_poll_all``) so only one thread is occupied per cycle.
-        The entire job is wrapped with ``asyncio.wait_for`` to guarantee
-        the executor thread is released even if the request-level
-        timeout is ineffective (DNS hang, SDK internals change, etc.).
+
+        ``_poll_all`` acquires ``_poll_lock`` (a ``threading.Lock``) so
+        that at most one executor thread performs API calls at any time.
+        If a previous thread is still running (e.g. surviving an async
+        timeout), the new thread returns ``None`` immediately instead
+        of piling up — this prevents the thread-pool starvation that
+        causes UI freezes on constrained hardware like the HA Yellow.
+
+        ``asyncio.wait_for`` is kept so the coordinator can report a
+        timeout and retry on schedule, but it does **not** cancel the
+        executor thread.  The thread releases ``_poll_lock`` when its
+        HTTP calls finally complete or time out at the ``requests``
+        level.
         """
-        if self._poll_in_progress:
-            _LOGGER.debug("Poll already in progress, skipping")
+        try:
+            result = await asyncio.wait_for(
+                self.hass.async_add_executor_job(self._poll_all),
+                timeout=_POLL_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "Seam API poll timed out after %ds; executor thread "
+                "will release when its HTTP calls complete",
+                _POLL_TIMEOUT_SECONDS,
+            )
+            raise UpdateFailed(
+                f"Poll timed out after {_POLL_TIMEOUT_SECONDS}s"
+            ) from None
+
+        if result is None:
+            _LOGGER.debug(
+                "Poll skipped — previous executor thread still active"
+            )
             return self.data
 
-        self._poll_in_progress = True
-        try:
-            try:
-                result = await asyncio.wait_for(
-                    self.hass.async_add_executor_job(self._poll_all),
-                    timeout=_POLL_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "Seam API poll timed out after %ds", _POLL_TIMEOUT_SECONDS
-                )
-                raise UpdateFailed(
-                    f"Poll timed out after {_POLL_TIMEOUT_SECONDS}s"
-                ) from None
+        prev = self.data
 
-            prev = self.data
+        # -- Unpack device (required) --------------------------------------
+        device = result.get("device")
+        device_error = result.get("device_error")
+        if device_error is not None:
+            raise UpdateFailed(
+                f"Device poll failed: {device_error}"
+            ) from device_error
 
-            # -- Unpack device (required) --------------------------------------
-            device = result.get("device")
-            device_error = result.get("device_error")
-            if device_error is not None:
-                raise UpdateFailed(
-                    f"Device poll failed: {device_error}"
-                ) from device_error
+        prev.device_name = (
+            getattr(device, "display_name", None) or prev.device_name
+        )
+        props = device.properties
+        prev.locked = getattr(props, "locked", prev.locked)
+        prev.online = getattr(props, "online", prev.online)
 
-            prev.device_name = (
-                getattr(device, "display_name", None) or prev.device_name
+        model_obj = getattr(props, "model", None)
+        if model_obj:
+            mdname = getattr(model_obj, "display_name", None)
+            if mdname:
+                prev.model_display_name = mdname
+
+        battery = getattr(props, "battery", None)
+        if battery:
+            level = getattr(battery, "level", None)
+            if level is not None:
+                prev.battery_level = round(level * 100, 1)
+            prev.battery_status = getattr(
+                battery, "status", prev.battery_status
             )
-            props = device.properties
-            prev.locked = getattr(props, "locked", prev.locked)
-            prev.online = getattr(props, "online", prev.online)
+        else:
+            raw = getattr(props, "battery_level", None)
+            if raw is not None:
+                prev.battery_level = round(raw * 100, 1)
 
-            model_obj = getattr(props, "model", None)
-            if model_obj:
-                mdname = getattr(model_obj, "display_name", None)
-                if mdname:
-                    prev.model_display_name = mdname
+        prev.door_open = getattr(props, "door_open", prev.door_open)
 
-            battery = getattr(props, "battery", None)
-            if battery:
-                level = getattr(battery, "level", None)
-                if level is not None:
-                    prev.battery_level = round(level * 100, 1)
-                prev.battery_status = getattr(
-                    battery, "status", prev.battery_status
-                )
-            else:
-                raw = getattr(props, "battery_level", None)
-                if raw is not None:
-                    prev.battery_level = round(raw * 100, 1)
+        # -- Unpack access codes (non-fatal) -------------------------------
+        codes = result.get("codes")
+        if codes is not None:
+            prev.access_codes = {
+                c.access_code_id: c.name
+                or f"Unnamed Code ({c.access_code_id[:8]})"
+                for c in codes
+            }
 
-            prev.door_open = getattr(props, "door_open", prev.door_open)
+        # -- Unpack events (non-fatal) -------------------------------------
+        api_events = result.get("events")
+        if api_events is not None:
+            prev.events = self._merge_events(prev.events, api_events)
+            self._dispatch_new_events(api_events)
 
-            # -- Unpack access codes (non-fatal) -------------------------------
-            codes = result.get("codes")
-            if codes is not None:
-                prev.access_codes = {
-                    c.access_code_id: c.name
-                    or f"Unnamed Code ({c.access_code_id[:8]})"
-                    for c in codes
-                }
-
-            # -- Unpack events (non-fatal) -------------------------------------
-            api_events = result.get("events")
-            if api_events is not None:
-                prev.events = self._merge_events(prev.events, api_events)
-                self._dispatch_new_events(api_events)
-
-            self._derive_summary(prev)
-            return prev
-
-        finally:
-            self._poll_in_progress = False
+        self._derive_summary(prev)
+        return prev
 
     # -- API call wrappers -----------------------------------------------------
 
-    def _poll_all(self) -> dict[str, Any]:
+    def _poll_all(self) -> dict[str, Any] | None:
         """Run all Seam API calls in a single executor job.
 
-        Keeps the synchronous SDK work on one thread and returns a plain
-        dict so the async caller can unpack results on the event loop.
+        Acquires ``_poll_lock`` to ensure only one executor thread
+        performs API calls at a time.  Returns ``None`` (without
+        blocking) if another thread already holds the lock — the async
+        caller treats this as "previous poll still running, skip".
         """
-        result: dict[str, Any] = {}
-
-        # Device state (required — failure aborts the poll)
+        if not self._poll_lock.acquire(blocking=False):
+            return None
         try:
-            result["device"] = self.seam.devices.get(
-                device_id=self._device_id
-            )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Device poll failed: %s", err)
-            result["device_error"] = err
+            result: dict[str, Any] = {}
+
+            # Device state (required — failure aborts the poll)
+            try:
+                result["device"] = self.seam.devices.get(
+                    device_id=self._device_id
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Device poll failed: %s", err)
+                result["device_error"] = err
+                return result
+
+            # Access codes (non-fatal)
+            try:
+                result["codes"] = self.seam.access_codes.list(
+                    device_id=self._device_id
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Access codes fetch failed: %s", err)
+
+            # Events (non-fatal)
+            try:
+                result["events"] = self._fetch_events()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Events fetch failed: %s", err)
+
             return result
-
-        # Access codes (non-fatal)
-        try:
-            result["codes"] = self.seam.access_codes.list(
-                device_id=self._device_id
-            )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("Access codes fetch failed: %s", err)
-
-        # Events (non-fatal)
-        try:
-            result["events"] = self._fetch_events()
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Events fetch failed: %s", err)
-
-        return result
+        finally:
+            self._poll_lock.release()
 
     def _fetch_events(self) -> list[dict[str, Any]]:
         """Fetch events — tries single ``event_types`` call first."""
