@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -39,18 +40,24 @@ _EVENT_LOOKBACK_DAYS = 7
 # Hard ceiling on stored events to bound memory.
 _MAX_STORED_EVENTS = 100
 
-# Timeout for individual Seam API calls (seconds).
-# Enforced via monkey-patch on the SDK's underlying requests.Session.
-_API_TIMEOUT_SECONDS = 15
+# Timeout for individual Seam API calls — (connect, read) tuple.
+# Connect covers DNS + TCP + TLS handshake; read covers waiting for
+# the response body.  Keeping connect short ensures a DNS hang or
+# unreachable host fails fast instead of blocking an executor thread.
+_API_TIMEOUT: tuple[int, int] = (5, 10)
 
 # Async-level ceiling for the entire poll cycle (all API calls combined).
-# Prevents indefinite executor thread occupation when the Seam API hangs
-# or the request-level timeout is ineffective (e.g. DNS resolution hang).
-_POLL_TIMEOUT_SECONDS = 45
+# If exceeded, the _abort event is set so the executor thread stops
+# between API calls rather than continuing the full sequence.
+_POLL_TIMEOUT_SECONDS = 30
 
-# Maximum event types to query individually in the fallback path.
-# Limits executor thread occupation when the batch event_types param fails.
-_MAX_FALLBACK_EVENT_TYPES = 3
+# How often to re-fetch access codes (seconds).  Access codes rarely
+# change, so polling them every cycle wastes an API call + thread time.
+_ACCESS_CODE_REFRESH_SECONDS = 300  # 5 min
+
+# How often to re-fetch event history when webhooks deliver events in
+# real-time (seconds).  Set to 0 to disable throttling.
+_EVENT_REFRESH_SECONDS = 300  # 5 min
 
 
 def _create_seam_with_timeout(api_key: str) -> Seam:
@@ -61,14 +68,14 @@ def _create_seam_with_timeout(api_key: str) -> Seam:
     thread indefinitely if the Seam API is slow or unreachable.
 
     We monkey-patch ``Session.request`` so that **every** call made
-    through this client has a ceiling of ``_API_TIMEOUT_SECONDS``.
+    through this client has a ceiling of ``_API_TIMEOUT``.
     """
     seam = Seam(api_key=api_key)
     _orig_request = seam.client.request
 
     def _timeout_request(method: str, url: str, **kwargs: Any) -> Any:
         if kwargs.get("timeout") is None:
-            kwargs["timeout"] = _API_TIMEOUT_SECONDS
+            kwargs["timeout"] = _API_TIMEOUT
         return _orig_request(method, url, **kwargs)
 
     seam.client.request = _timeout_request  # type: ignore[assignment]
@@ -122,6 +129,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         device_id: str,
         poll_interval: int = DEFAULT_POLL_INTERVAL,
         event_limit: int = DEFAULT_EVENT_LIMIT,
+        webhook_active: bool = False,
     ) -> None:
         super().__init__(
             hass,
@@ -135,9 +143,23 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         self._seam: Seam | None = None
         self._reconcile_unsub: CALLBACK_TYPE | None = None
         self._poll_lock = threading.Lock()
+        # Set by the async side on timeout so the executor thread stops
+        # between API calls instead of running the full sequence.
+        self._abort = threading.Event()
+        self._webhook_active = webhook_active
+
+        # Throttle secondary API calls that rarely yield new data.
+        # 0.0 is a sentinel meaning "never fetched" — first poll always runs.
+        self._last_access_code_fetch: float = 0.0
+        self._last_event_fetch: float = 0.0
+        # True when the current poll is a post-webhook reconciliation
+        # (only device state needed — webhook already delivered the event).
+        self._is_reconciliation = False
 
         self.data = SeamLockData()
         self._event_listeners: list[callback] = []
+        # Persistent set of event IDs for O(1) webhook dedup.
+        self._event_id_cache: set[str] = set()
         # Track which event IDs have been dispatched to listeners so
         # the polling path can detect genuinely new events.
         self._dispatched_event_ids: set[str] = set()
@@ -169,6 +191,9 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
     def shutdown(self) -> None:
         """Release all resources.  Called from ``async_unload_entry``."""
+        # Signal any in-flight executor job to stop early
+        self._abort.set()
+
         # Cancel any pending reconciliation timer
         if self._reconcile_unsub is not None:
             self._reconcile_unsub()
@@ -184,8 +209,9 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                 pass
             self._seam = None
 
-        # Drop listener references
+        # Drop listener references and caches
         self._event_listeners.clear()
+        self._event_id_cache.clear()
         self._dispatched_event_ids.clear()
         self._dispatch_seeded = False
 
@@ -219,17 +245,24 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         elif event_type == "device.disconnected":
             self.data.online = False
 
-        # Dedup and append (O(n) with n capped at _MAX_STORED_EVENTS)
-        existing_ids = {
-            e.get("event_id") for e in self.data.events if e.get("event_id")
-        }
-        if entry["event_id"] not in existing_ids:
+        # Dedup via persistent cache — O(1) lookup instead of rebuilding
+        # a set from self.data.events on every webhook.
+        eid = entry["event_id"]
+        if eid not in self._event_id_cache:
             self.data.events.insert(0, entry)
+            self._event_id_cache.add(eid)
             if len(self.data.events) > _MAX_STORED_EVENTS:
                 del self.data.events[_MAX_STORED_EVENTS:]
+            # Prune cache when it grows too large
+            if len(self._event_id_cache) > _MAX_STORED_EVENTS * 2:
+                self._event_id_cache = {
+                    e.get("event_id")
+                    for e in self.data.events
+                    if e.get("event_id")
+                }
 
         # Mark as dispatched so the polling path doesn't re-fire it
-        self._dispatched_event_ids.add(entry["event_id"])
+        self._dispatched_event_ids.add(eid)
         # Cap the tracking set to avoid unbounded growth
         if len(self._dispatched_event_ids) > _MAX_STORED_EVENTS * 2:
             self._dispatched_event_ids = {
@@ -264,7 +297,13 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         self._schedule_reconcile()
 
     def _schedule_reconcile(self) -> None:
-        """Schedule a single delayed API poll.  Self-debouncing."""
+        """Schedule a single delayed API poll.  Self-debouncing.
+
+        Sets ``_is_reconciliation`` so the poll only fetches device state
+        (the webhook already delivered the event and access codes don't
+        change on lock events).  This reduces the reconciliation from
+        3 API calls to 1, cutting executor thread occupation by ~2/3.
+        """
         if self._reconcile_unsub is not None:
             self._reconcile_unsub()
             self._reconcile_unsub = None
@@ -272,6 +311,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         @callback
         def _do_reconcile(_now: datetime) -> None:
             self._reconcile_unsub = None
+            self._is_reconciliation = True
             self.hass.async_create_task(self.async_request_refresh())
 
         self._reconcile_unsub = async_call_later(
@@ -293,26 +333,29 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         of piling up — this prevents the thread-pool starvation that
         causes UI freezes on constrained hardware like the HA Yellow.
 
-        ``asyncio.wait_for`` is kept so the coordinator can report a
-        timeout and retry on schedule, but it does **not** cancel the
-        executor thread.  The thread releases ``_poll_lock`` when its
-        HTTP calls finally complete or time out at the ``requests``
-        level.
+        On timeout, ``_abort`` is set so the executor thread stops
+        between API calls rather than continuing the full sequence.
+        This limits post-timeout thread occupation to at most one
+        in-flight HTTP call (~10 s) instead of all remaining calls.
         """
+        self._abort.clear()
         try:
             result = await asyncio.wait_for(
                 self.hass.async_add_executor_job(self._poll_all),
                 timeout=_POLL_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
+            self._abort.set()
             _LOGGER.warning(
-                "Seam API poll timed out after %ds; executor thread "
-                "will release when its HTTP calls complete",
+                "Seam API poll timed out after %ds; signalled executor "
+                "thread to stop after its current HTTP call",
                 _POLL_TIMEOUT_SECONDS,
             )
             raise UpdateFailed(
                 f"Poll timed out after {_POLL_TIMEOUT_SECONDS}s"
             ) from None
+        finally:
+            self._is_reconciliation = False
 
         if result is None:
             _LOGGER.debug(
@@ -385,11 +428,18 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         performs API calls at a time.  Returns ``None`` (without
         blocking) if another thread already holds the lock — the async
         caller treats this as "previous poll still running, skip".
+
+        Checks ``_abort`` between calls so the thread stops quickly
+        when the async side has timed out.  Reconciliation polls
+        (after a webhook) only fetch device state.  Access codes
+        and event history are independently throttled by time.
         """
         if not self._poll_lock.acquire(blocking=False):
             return None
         try:
             result: dict[str, Any] = {}
+            now = time.monotonic()
+            reconciling = self._is_reconciliation
 
             # Device state (required — failure aborts the poll)
             try:
@@ -401,61 +451,77 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                 result["device_error"] = err
                 return result
 
-            # Access codes (non-fatal)
-            try:
-                result["codes"] = self.seam.access_codes.list(
-                    device_id=self._device_id
-                )
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Access codes fetch failed: %s", err)
+            # Reconciliation only needs device state — the webhook
+            # already delivered the event and access codes don't change.
+            if reconciling:
+                return result
 
-            # Events (non-fatal)
-            try:
-                result["events"] = self._fetch_events()
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("Events fetch failed: %s", err)
+            # Abort check: async side timed out, stop making calls
+            if self._abort.is_set():
+                return result
+
+            # Access codes — throttled (rarely change)
+            needs_codes = (
+                self._last_access_code_fetch == 0.0
+                or now - self._last_access_code_fetch
+                >= _ACCESS_CODE_REFRESH_SECONDS
+            )
+            if needs_codes:
+                try:
+                    result["codes"] = self.seam.access_codes.list(
+                        device_id=self._device_id
+                    )
+                    self._last_access_code_fetch = now
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug("Access codes fetch failed: %s", err)
+
+            # Abort check
+            if self._abort.is_set():
+                return result
+
+            # Events — throttled when webhooks deliver them in real-time
+            skip_events = (
+                self._webhook_active
+                and self._last_event_fetch != 0.0
+                and now - self._last_event_fetch < _EVENT_REFRESH_SECONDS
+            )
+            if not skip_events:
+                try:
+                    result["events"] = self._fetch_events()
+                    self._last_event_fetch = now
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning("Events fetch failed: %s", err)
 
             return result
         finally:
             self._poll_lock.release()
 
     def _fetch_events(self) -> list[dict[str, Any]]:
-        """Fetch events — tries single ``event_types`` call first."""
+        """Fetch events via a single batch API call.
+
+        Uses the ``event_types`` (plural) parameter supported by
+        seam >= 0.24.0.  No fallback to individual per-type calls —
+        those would multiply executor thread occupation and are the
+        main cause of thread-pool starvation on constrained hardware.
+        If this call fails, the caller's blanket except skips events
+        for this cycle; they'll be picked up on the next poll.
+        """
         since_dt = datetime.now(timezone.utc) - timedelta(
             days=_EVENT_LOOKBACK_DAYS
         )
         since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-        # All event types we want in the timeline
         all_event_types = [
             "lock.unlocked", "lock.locked", "lock.access_denied",
             *DEVICE_EVENT_TYPES,
         ]
 
-        raw: list[Any] = []
-        try:
-            evts = self.seam.events.list(
-                device_id=self._device_id,
-                event_types=all_event_types,
-                since=since_str,
-                limit=self._event_limit,
-            )
-            raw.extend(evts)
-        except Exception:  # noqa: BLE001
-            # Fallback for older SDK versions without event_types (plural).
-            # Only query the most important types to limit executor thread
-            # occupation — each call is a blocking HTTP request.
-            for etype in all_event_types[:_MAX_FALLBACK_EVENT_TYPES]:
-                try:
-                    evts = self.seam.events.list(
-                        device_id=self._device_id,
-                        event_type=etype,
-                        since=since_str,
-                        limit=self._event_limit,
-                    )
-                    raw.extend(evts)
-                except Exception as err2:  # noqa: BLE001
-                    _LOGGER.debug("events.list(%s) failed: %s", etype, err2)
+        raw = self.seam.events.list(
+            device_id=self._device_id,
+            event_types=all_event_types,
+            since=since_str,
+            limit=self._event_limit,
+        )
 
         normalised: list[dict[str, Any]] = []
         for ev in raw:
@@ -635,9 +701,19 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         return merged[:_MAX_STORED_EVENTS]
 
     def _derive_summary(self, data: SeamLockData) -> None:
-        """Recompute summary fields using HA's configured timezone."""
+        """Recompute summary fields using HA's configured timezone.
+
+        Computes the UTC boundary for "today" once, then uses simple
+        datetime comparison per event instead of per-event astimezone()
+        calls — avoids repeated timezone conversion overhead.
+        """
         local_now = dt_util.now()
-        today_local = local_now.date()
+        # Start-of-today in local tz, converted to UTC for direct comparison
+        today_start_local = local_now.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        today_start_utc = today_start_local.astimezone(timezone.utc)
+
         unlocks_today = 0
         found_unlock = False
         found_lock = False
@@ -663,12 +739,12 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
                 found_lock = True
 
             if etype == "lock.unlocked" and occurred_dt is not None:
-                try:
-                    local_event = occurred_dt.astimezone(local_now.tzinfo)
-                    if local_event.date() == today_local:
-                        unlocks_today += 1
-                except (ValueError, AttributeError, TypeError):
-                    pass
+                if occurred_dt >= today_start_utc:
+                    unlocks_today += 1
+                elif found_unlock and found_lock:
+                    # Events are sorted newest-first; once we pass today
+                    # and have both summaries, no useful work remains.
+                    break
 
         data.total_unlocks_today = unlocks_today
 

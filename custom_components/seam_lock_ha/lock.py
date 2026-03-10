@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -146,11 +147,16 @@ class SeamLock(
     async def async_lock(self, **kwargs: Any) -> None:
         """Lock the door."""
         try:
-            await self.hass.async_add_executor_job(
-                lambda: self.coordinator.seam.locks.lock_door(
-                    device_id=self._device_id
-                )
+            await asyncio.wait_for(
+                self.hass.async_add_executor_job(
+                    lambda: self.coordinator.seam.locks.lock_door(
+                        device_id=self._device_id
+                    )
+                ),
+                timeout=20,
             )
+        except asyncio.TimeoutError:
+            raise HomeAssistantError("Lock command timed out") from None
         except Exception as err:
             _LOGGER.error("Lock command failed: %s", err)
             raise HomeAssistantError(f"Failed to lock: {err}") from err
@@ -160,11 +166,16 @@ class SeamLock(
     async def async_unlock(self, **kwargs: Any) -> None:
         """Unlock the door."""
         try:
-            await self.hass.async_add_executor_job(
-                lambda: self.coordinator.seam.locks.unlock_door(
-                    device_id=self._device_id
-                )
+            await asyncio.wait_for(
+                self.hass.async_add_executor_job(
+                    lambda: self.coordinator.seam.locks.unlock_door(
+                        device_id=self._device_id
+                    )
+                ),
+                timeout=20,
             )
+        except asyncio.TimeoutError:
+            raise HomeAssistantError("Unlock command timed out") from None
         except Exception as err:
             _LOGGER.error("Unlock command failed: %s", err)
             raise HomeAssistantError(f"Failed to unlock: {err}") from err

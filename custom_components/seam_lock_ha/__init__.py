@@ -182,6 +182,7 @@ async def async_setup_entry(
         device_id=device_id,
         poll_interval=poll_interval,
         event_limit=event_limit,
+        webhook_active=bool(webhook_secret),
     )
     await coordinator.async_config_entry_first_refresh()
 
