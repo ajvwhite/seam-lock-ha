@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -48,7 +49,10 @@ class SeamLockConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
                 seam = _create_seam_with_timeout(api_key)
                 try:
-                    devices = await self.hass.async_add_executor_job(seam.locks.list)
+                    devices = await asyncio.wait_for(
+                        self.hass.async_add_executor_job(seam.locks.list),
+                        timeout=20,
+                    )
                 finally:
                     # Close the validation client's HTTP session immediately
                     # to avoid leaking TCP sockets from the connection pool.
