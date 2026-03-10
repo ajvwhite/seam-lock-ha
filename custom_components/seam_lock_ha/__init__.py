@@ -288,12 +288,20 @@ def _build_webhook_handler(entry_id: str):
             return Response(status=400, text="Bad request")
 
         # -- Signature verification (cached verifier) --------------------------
+        # Run verification off the event loop — the Svix library does
+        # HMAC + timestamp parsing which is CPU work that should not
+        # block the event loop on constrained hardware.
         verifier = runtime.get_verifier()
         if verifier is not None:
             try:
                 headers = dict(request.headers)
-                verified_event = verifier.verify(
-                    raw_body.decode("utf-8"), headers
+                body_str = raw_body.decode("utf-8")
+
+                def _verify() -> Any:
+                    return verifier.verify(body_str, headers)
+
+                verified_event = await hass.async_add_executor_job(
+                    _verify
                 )
                 payload = {
                     "event_id": getattr(verified_event, "event_id", None),

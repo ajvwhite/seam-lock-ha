@@ -145,17 +145,23 @@ class SeamLock(
         return attrs
 
     async def async_lock(self, **kwargs: Any) -> None:
-        """Lock the door."""
+        """Lock the door.
+
+        Runs through ``coordinator.run_command`` so the API call is
+        serialised with polls — at most one executor thread is ever
+        blocked on the Seam API at a time.
+        """
         try:
             await asyncio.wait_for(
                 self.hass.async_add_executor_job(
+                    self.coordinator.run_command,
                     lambda: self.coordinator.seam.locks.lock_door(
                         device_id=self._device_id
-                    )
+                    ),
                 ),
-                timeout=20,
+                timeout=15,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             raise HomeAssistantError("Lock command timed out") from None
         except Exception as err:
             _LOGGER.error("Lock command failed: %s", err)
@@ -164,17 +170,23 @@ class SeamLock(
         self.coordinator.async_set_updated_data(self.coordinator.data)
 
     async def async_unlock(self, **kwargs: Any) -> None:
-        """Unlock the door."""
+        """Unlock the door.
+
+        Runs through ``coordinator.run_command`` so the API call is
+        serialised with polls — at most one executor thread is ever
+        blocked on the Seam API at a time.
+        """
         try:
             await asyncio.wait_for(
                 self.hass.async_add_executor_job(
+                    self.coordinator.run_command,
                     lambda: self.coordinator.seam.locks.unlock_door(
                         device_id=self._device_id
-                    )
+                    ),
                 ),
-                timeout=20,
+                timeout=15,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             raise HomeAssistantError("Unlock command timed out") from None
         except Exception as err:
             _LOGGER.error("Unlock command failed: %s", err)

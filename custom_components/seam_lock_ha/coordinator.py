@@ -44,7 +44,7 @@ _MAX_STORED_EVENTS = 100
 # Connect covers DNS + TCP + TLS handshake; read covers waiting for
 # the response body.  Keeping connect short ensures a DNS hang or
 # unreachable host fails fast instead of blocking an executor thread.
-_API_TIMEOUT: tuple[int, int] = (5, 10)
+_API_TIMEOUT: tuple[int, int] = (3, 7)
 
 # Async-level ceiling for the entire poll cycle (all API calls combined).
 # If exceeded, the _abort event is set so the executor thread stops
@@ -188,6 +188,23 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         if self._seam is None:
             self._seam = _create_seam_with_timeout(self._api_key)
         return self._seam
+
+    def run_command(self, func: Any) -> Any:
+        """Run a Seam API command serialised with polls.
+
+        Acquires ``_poll_lock`` so the command never overlaps with a
+        poll or another command.  Checks ``_abort`` before the call
+        and propagates it so timed-out callers don't leave the thread
+        blocked longer than necessary.
+        """
+        if not self._poll_lock.acquire(timeout=10):
+            raise TimeoutError("Seam API busy — could not acquire lock")
+        try:
+            if self._abort.is_set():
+                raise TimeoutError("Seam API call aborted")
+            return func()
+        finally:
+            self._poll_lock.release()
 
     def shutdown(self) -> None:
         """Release all resources.  Called from ``async_unload_entry``."""
@@ -338,7 +355,6 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         This limits post-timeout thread occupation to at most one
         in-flight HTTP call (~10 s) instead of all remaining calls.
         """
-        self._abort.clear()
         try:
             result = await asyncio.wait_for(
                 self.hass.async_add_executor_job(self._poll_all),
@@ -437,6 +453,9 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         if not self._poll_lock.acquire(blocking=False):
             return None
         try:
+            # Clear _abort *after* acquiring the lock so we never
+            # accidentally clear a signal meant for a previous cycle.
+            self._abort.clear()
             result: dict[str, Any] = {}
             now = time.monotonic()
             reconciling = self._is_reconciliation
