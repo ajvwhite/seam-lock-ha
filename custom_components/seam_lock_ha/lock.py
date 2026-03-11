@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -147,21 +146,16 @@ class SeamLock(
     async def async_lock(self, **kwargs: Any) -> None:
         """Lock the door.
 
-        Runs through ``coordinator.run_command`` so the API call is
-        serialised with polls — at most one executor thread is ever
-        blocked on the Seam API at a time.
+        Serialised with polls via ``async_run_command`` — waits at
+        the async level (zero thread consumption) if a poll is active.
         """
         try:
-            await asyncio.wait_for(
-                self.hass.async_add_executor_job(
-                    self.coordinator.run_command,
-                    lambda: self.coordinator.seam.locks.lock_door(
-                        device_id=self._device_id
-                    ),
+            await self.coordinator.async_run_command(
+                lambda: self.coordinator.seam.locks.lock_door(
+                    device_id=self._device_id
                 ),
-                timeout=15,
             )
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             raise HomeAssistantError("Lock command timed out") from None
         except Exception as err:
             _LOGGER.error("Lock command failed: %s", err)
@@ -172,21 +166,16 @@ class SeamLock(
     async def async_unlock(self, **kwargs: Any) -> None:
         """Unlock the door.
 
-        Runs through ``coordinator.run_command`` so the API call is
-        serialised with polls — at most one executor thread is ever
-        blocked on the Seam API at a time.
+        Serialised with polls via ``async_run_command`` — waits at
+        the async level (zero thread consumption) if a poll is active.
         """
         try:
-            await asyncio.wait_for(
-                self.hass.async_add_executor_job(
-                    self.coordinator.run_command,
-                    lambda: self.coordinator.seam.locks.unlock_door(
-                        device_id=self._device_id
-                    ),
+            await self.coordinator.async_run_command(
+                lambda: self.coordinator.seam.locks.unlock_door(
+                    device_id=self._device_id
                 ),
-                timeout=15,
             )
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             raise HomeAssistantError("Unlock command timed out") from None
         except Exception as err:
             _LOGGER.error("Unlock command failed: %s", err)

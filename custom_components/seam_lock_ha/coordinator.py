@@ -82,6 +82,10 @@ def _create_seam_with_timeout(api_key: str) -> Seam:
     return seam
 
 
+class _ApiBusy(Exception):
+    """Raised by run_command when _poll_lock is held by a poll."""
+
+
 class SeamLockData:
     """Container for all data about the lock."""
 
@@ -189,22 +193,45 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
             self._seam = _create_seam_with_timeout(self._api_key)
         return self._seam
 
-    def run_command(self, func: Any) -> Any:
+    def _run_command_sync(self, func: Any) -> Any:
         """Run a Seam API command serialised with polls.
 
-        Acquires ``_poll_lock`` so the command never overlaps with a
-        poll or another command.  Checks ``_abort`` before the call
-        and propagates it so timed-out callers don't leave the thread
-        blocked longer than necessary.
+        Uses **non-blocking** lock acquisition so the executor thread
+        is never held hostage waiting for a poll to finish.  Raises
+        ``_ApiBusy`` immediately if a poll holds the lock — the async
+        caller (``async_run_command``) retries from the event loop
+        where waiting is free.
         """
-        if not self._poll_lock.acquire(timeout=10):
-            raise TimeoutError("Seam API busy — could not acquire lock")
+        if not self._poll_lock.acquire(blocking=False):
+            raise _ApiBusy
         try:
             if self._abort.is_set():
                 raise TimeoutError("Seam API call aborted")
             return func()
         finally:
             self._poll_lock.release()
+
+    async def async_run_command(self, func: Any) -> Any:
+        """Run a Seam API command, serialised with polls.
+
+        Instead of blocking an executor thread for up to 10 s waiting
+        on ``_poll_lock``, this retries from the async side — the
+        coroutine is simply suspended between attempts, consuming
+        **zero executor threads** while waiting for a poll to finish.
+        """
+        try:
+            async with asyncio.timeout(15):
+                while True:
+                    try:
+                        return await self.hass.async_add_executor_job(
+                            self._run_command_sync, func
+                        )
+                    except _ApiBusy:
+                        await asyncio.sleep(0.5)
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                "Seam API busy — timed out waiting for command"
+            ) from None
 
     def shutdown(self) -> None:
         """Release all resources.  Called from ``async_unload_entry``."""
