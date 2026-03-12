@@ -26,6 +26,7 @@ from homeassistant.components.webhook import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     CONF_API_KEY,
@@ -176,8 +177,10 @@ async def async_setup_entry(
     if webhook_secret and poll_interval == DEFAULT_POLL_INTERVAL:
         poll_interval = DEFAULT_POLL_INTERVAL_WEBHOOK
 
+    session = async_get_clientsession(hass)
     coordinator = SeamLockCoordinator(
         hass,
+        session=session,
         api_key=api_key,
         device_id=device_id,
         poll_interval=poll_interval,

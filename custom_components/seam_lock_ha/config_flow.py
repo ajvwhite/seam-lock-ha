@@ -45,21 +45,17 @@ class SeamLockConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             api_key = user_input[CONF_API_KEY]
             try:
-                from .coordinator import _create_seam_with_timeout
+                from homeassistant.helpers.aiohttp_client import (
+                    async_get_clientsession,
+                )
 
-                seam = _create_seam_with_timeout(api_key)
-                try:
-                    devices = await asyncio.wait_for(
-                        self.hass.async_add_executor_job(seam.locks.list),
-                        timeout=20,
-                    )
-                finally:
-                    # Close the validation client's HTTP session immediately
-                    # to avoid leaking TCP sockets from the connection pool.
-                    try:
-                        seam.client.close()
-                    except Exception:  # noqa: BLE001
-                        pass
+                from .coordinator import AsyncSeamClient
+
+                session = async_get_clientsession(self.hass)
+                client = AsyncSeamClient(session, api_key)
+                devices = await asyncio.wait_for(
+                    client.list_locks(), timeout=20
+                )
 
                 if not devices:
                     errors["base"] = "no_devices"
@@ -67,10 +63,10 @@ class SeamLockConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     self._api_key = api_key
                     self._devices = [
                         {
-                            "device_id": d.device_id,
-                            "name": getattr(d, "display_name", None)
-                            or d.device_id,
-                            "type": getattr(d, "device_type", "unknown"),
+                            "device_id": d.get("device_id", ""),
+                            "name": d.get("display_name")
+                            or d.get("device_id", ""),
+                            "type": d.get("device_type", "unknown"),
                         }
                         for d in devices
                     ]

@@ -144,17 +144,9 @@ class SeamLock(
         return attrs
 
     async def async_lock(self, **kwargs: Any) -> None:
-        """Lock the door.
-
-        Serialised with polls via ``async_run_command`` — waits at
-        the async level (zero thread consumption) if a poll is active.
-        """
+        """Lock the door via the async API client (zero threads)."""
         try:
-            await self.coordinator.async_run_command(
-                lambda: self.coordinator.seam.locks.lock_door(
-                    device_id=self._device_id
-                ),
-            )
+            await self.coordinator.client.lock_door(self._device_id)
         except TimeoutError:
             raise HomeAssistantError("Lock command timed out") from None
         except Exception as err:
@@ -164,17 +156,9 @@ class SeamLock(
         self.coordinator.async_set_updated_data(self.coordinator.data)
 
     async def async_unlock(self, **kwargs: Any) -> None:
-        """Unlock the door.
-
-        Serialised with polls via ``async_run_command`` — waits at
-        the async level (zero thread consumption) if a poll is active.
-        """
+        """Unlock the door via the async API client (zero threads)."""
         try:
-            await self.coordinator.async_run_command(
-                lambda: self.coordinator.seam.locks.unlock_door(
-                    device_id=self._device_id
-                ),
-            )
+            await self.coordinator.client.unlock_door(self._device_id)
         except TimeoutError:
             raise HomeAssistantError("Unlock command timed out") from None
         except Exception as err:

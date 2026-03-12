@@ -5,12 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from seam import Seam
+import aiohttp
 
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later
@@ -40,19 +39,21 @@ _EVENT_LOOKBACK_DAYS = 7
 # Hard ceiling on stored events to bound memory.
 _MAX_STORED_EVENTS = 100
 
-# Timeout for individual Seam API calls — (connect, read) tuple.
-# Connect covers DNS + TCP + TLS handshake; read covers waiting for
-# the response body.  Keeping connect short ensures a DNS hang or
-# unreachable host fails fast instead of blocking an executor thread.
-_API_TIMEOUT: tuple[int, int] = (3, 7)
+# Seam API base URL.
+_SEAM_API_BASE = "https://connect.getseam.com"
+
+# Timeout for individual Seam API calls.
+# total covers the full request lifecycle; connect covers DNS + TCP + TLS.
+_API_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=3)
+
+# Timeout for lock/unlock commands (action may wait for confirmation).
+_COMMAND_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=3)
 
 # Async-level ceiling for the entire poll cycle (all API calls combined).
-# If exceeded, the _abort event is set so the executor thread stops
-# between API calls rather than continuing the full sequence.
 _POLL_TIMEOUT_SECONDS = 30
 
 # How often to re-fetch access codes (seconds).  Access codes rarely
-# change, so polling them every cycle wastes an API call + thread time.
+# change, so polling them every cycle wastes an API call.
 _ACCESS_CODE_REFRESH_SECONDS = 300  # 5 min
 
 # How often to re-fetch event history when webhooks deliver events in
@@ -60,30 +61,92 @@ _ACCESS_CODE_REFRESH_SECONDS = 300  # 5 min
 _EVENT_REFRESH_SECONDS = 300  # 5 min
 
 
-def _create_seam_with_timeout(api_key: str) -> Seam:
-    """Create a Seam client with enforced request-level timeouts.
+class AsyncSeamClient:
+    """Lightweight async Seam API client using aiohttp.
 
-    The Seam SDK uses ``requests.Session`` internally but does not set
-    a default timeout.  Without one, any HTTP call can block an executor
-    thread indefinitely if the Seam API is slow or unreachable.
-
-    We monkey-patch ``Session.request`` so that **every** call made
-    through this client has a ceiling of ``_API_TIMEOUT``.
+    Replaces the synchronous ``seam`` SDK to eliminate executor thread
+    usage.  All HTTP calls are non-blocking and handled natively by
+    the event loop — zero threads consumed per API call.
     """
-    seam = Seam(api_key=api_key)
-    _orig_request = seam.client.request
 
-    def _timeout_request(method: str, url: str, **kwargs: Any) -> Any:
-        if kwargs.get("timeout") is None:
-            kwargs["timeout"] = _API_TIMEOUT
-        return _orig_request(method, url, **kwargs)
+    def __init__(
+        self, session: aiohttp.ClientSession, api_key: str
+    ) -> None:
+        self._session = session
+        self._headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
 
-    seam.client.request = _timeout_request  # type: ignore[assignment]
-    return seam
+    async def _post(
+        self,
+        path: str,
+        body: dict[str, Any] | None = None,
+        timeout: aiohttp.ClientTimeout = _API_TIMEOUT,
+    ) -> dict[str, Any]:
+        """POST to the Seam API and return the parsed JSON response."""
+        async with self._session.post(
+            f"{_SEAM_API_BASE}{path}",
+            json=body or {},
+            headers=self._headers,
+            timeout=timeout,
+        ) as resp:
+            resp.raise_for_status()
+            return await resp.json()
 
+    async def get_device(self, device_id: str) -> dict[str, Any]:
+        """Fetch a single device by ID."""
+        data = await self._post("/devices/get", {"device_id": device_id})
+        return data["device"]
 
-class _ApiBusy(Exception):
-    """Raised by run_command when _poll_lock is held by a poll."""
+    async def list_access_codes(
+        self, device_id: str
+    ) -> list[dict[str, Any]]:
+        """List access codes for a device."""
+        data = await self._post(
+            "/access_codes/list", {"device_id": device_id}
+        )
+        return data["access_codes"]
+
+    async def list_events(
+        self,
+        device_id: str,
+        event_types: list[str],
+        since: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """List events matching the given filters."""
+        data = await self._post(
+            "/events/list",
+            {
+                "device_id": device_id,
+                "event_types": event_types,
+                "since": since,
+                "limit": limit,
+            },
+        )
+        return data["events"]
+
+    async def lock_door(self, device_id: str) -> None:
+        """Send a lock command."""
+        await self._post(
+            "/locks/lock_door",
+            {"device_id": device_id},
+            timeout=_COMMAND_TIMEOUT,
+        )
+
+    async def unlock_door(self, device_id: str) -> None:
+        """Send an unlock command."""
+        await self._post(
+            "/locks/unlock_door",
+            {"device_id": device_id},
+            timeout=_COMMAND_TIMEOUT,
+        )
+
+    async def list_locks(self) -> list[dict[str, Any]]:
+        """List all locks visible to the API key (used by config flow)."""
+        data = await self._post("/locks/list")
+        return data.get("locks", [])
 
 
 class SeamLockData:
@@ -124,11 +187,19 @@ class SeamLockData:
 
 
 class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
-    """Coordinate Seam API polling and webhook-delivered updates."""
+    """Coordinate Seam API polling and webhook-delivered updates.
+
+    All API calls use aiohttp and run natively on the event loop —
+    zero executor threads are consumed.  Independent calls (device
+    state, access codes, event history) execute in parallel via
+    asyncio tasks, reducing total poll time compared to the previous
+    sequential executor approach.
+    """
 
     def __init__(
         self,
         hass: HomeAssistant,
+        session: aiohttp.ClientSession,
         api_key: str,
         device_id: str,
         poll_interval: int = DEFAULT_POLL_INTERVAL,
@@ -141,15 +212,10 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
             name=DOMAIN,
             update_interval=timedelta(seconds=poll_interval),
         )
-        self._api_key = api_key
         self._device_id = device_id
         self._event_limit = min(event_limit, _MAX_STORED_EVENTS)
-        self._seam: Seam | None = None
+        self._client = AsyncSeamClient(session, api_key)
         self._reconcile_unsub: CALLBACK_TYPE | None = None
-        self._poll_lock = threading.Lock()
-        # Set by the async side on timeout so the executor thread stops
-        # between API calls instead of running the full sequence.
-        self._abort = threading.Event()
         self._webhook_active = webhook_active
 
         # Throttle secondary API calls that rarely yield new data.
@@ -187,71 +253,16 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         return self._device_id
 
     @property
-    def seam(self) -> Seam:
-        """Lazy Seam client — created once, reused for all API calls."""
-        if self._seam is None:
-            self._seam = _create_seam_with_timeout(self._api_key)
-        return self._seam
-
-    def _run_command_sync(self, func: Any) -> Any:
-        """Run a Seam API command serialised with polls.
-
-        Uses **non-blocking** lock acquisition so the executor thread
-        is never held hostage waiting for a poll to finish.  Raises
-        ``_ApiBusy`` immediately if a poll holds the lock — the async
-        caller (``async_run_command``) retries from the event loop
-        where waiting is free.
-        """
-        if not self._poll_lock.acquire(blocking=False):
-            raise _ApiBusy
-        try:
-            if self._abort.is_set():
-                raise TimeoutError("Seam API call aborted")
-            return func()
-        finally:
-            self._poll_lock.release()
-
-    async def async_run_command(self, func: Any) -> Any:
-        """Run a Seam API command, serialised with polls.
-
-        Instead of blocking an executor thread for up to 10 s waiting
-        on ``_poll_lock``, this retries from the async side — the
-        coroutine is simply suspended between attempts, consuming
-        **zero executor threads** while waiting for a poll to finish.
-        """
-        try:
-            async with asyncio.timeout(15):
-                while True:
-                    try:
-                        return await self.hass.async_add_executor_job(
-                            self._run_command_sync, func
-                        )
-                    except _ApiBusy:
-                        await asyncio.sleep(0.5)
-        except asyncio.TimeoutError:
-            raise TimeoutError(
-                "Seam API busy — timed out waiting for command"
-            ) from None
+    def client(self) -> AsyncSeamClient:
+        """Public access to the async API client for lock/unlock commands."""
+        return self._client
 
     def shutdown(self) -> None:
         """Release all resources.  Called from ``async_unload_entry``."""
-        # Signal any in-flight executor job to stop early
-        self._abort.set()
-
         # Cancel any pending reconciliation timer
         if self._reconcile_unsub is not None:
             self._reconcile_unsub()
             self._reconcile_unsub = None
-
-        # Close the underlying requests.Session to release TCP sockets
-        # from the urllib3 connection pool.  Without this, each reload
-        # leaks a session with open connections.
-        if self._seam is not None:
-            try:
-                self._seam.client.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._seam = None
 
         # Drop listener references and caches
         self._event_listeners.clear()
@@ -345,8 +356,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
         Sets ``_is_reconciliation`` so the poll only fetches device state
         (the webhook already delivered the event and access codes don't
-        change on lock events).  This reduces the reconciliation from
-        3 API calls to 1, cutting executor thread occupation by ~2/3.
+        change on lock events).
         """
         if self._reconcile_unsub is not None:
             self._reconcile_unsub()
@@ -365,33 +375,19 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
     # -- Full polling path -----------------------------------------------------
 
     async def _async_update_data(self) -> SeamLockData:
-        """Full API poll.
+        """Full API poll — fully async, zero executor threads.
 
-        All synchronous Seam API calls run inside a **single** executor
-        job (``_poll_all``) so only one thread is occupied per cycle.
-
-        ``_poll_all`` acquires ``_poll_lock`` (a ``threading.Lock``) so
-        that at most one executor thread performs API calls at any time.
-        If a previous thread is still running (e.g. surviving an async
-        timeout), the new thread returns ``None`` immediately instead
-        of piling up — this prevents the thread-pool starvation that
-        causes UI freezes on constrained hardware like the HA Yellow.
-
-        On timeout, ``_abort`` is set so the executor thread stops
-        between API calls rather than continuing the full sequence.
-        This limits post-timeout thread occupation to at most one
-        in-flight HTTP call (~10 s) instead of all remaining calls.
+        All Seam API calls use aiohttp and run natively on the event
+        loop.  Independent calls (device, codes, events) execute in
+        parallel via asyncio tasks, reducing total poll time compared
+        to the previous sequential executor approach.
         """
         try:
-            result = await asyncio.wait_for(
-                self.hass.async_add_executor_job(self._poll_all),
-                timeout=_POLL_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            self._abort.set()
+            async with asyncio.timeout(_POLL_TIMEOUT_SECONDS):
+                return await self._async_poll()
+        except TimeoutError:
             _LOGGER.warning(
-                "Seam API poll timed out after %ds; signalled executor "
-                "thread to stop after its current HTTP call",
+                "Seam API poll timed out after %ds",
                 _POLL_TIMEOUT_SECONDS,
             )
             raise UpdateFailed(
@@ -400,158 +396,119 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         finally:
             self._is_reconciliation = False
 
-        if result is None:
-            _LOGGER.debug(
-                "Poll skipped — previous executor thread still active"
-            )
-            return self.data
-
+    async def _async_poll(self) -> SeamLockData:
+        """Execute all API fetches and unpack results."""
         prev = self.data
+        now = time.monotonic()
+        reconciling = self._is_reconciliation
 
-        # -- Unpack device (required) --------------------------------------
-        device = result.get("device")
-        device_error = result.get("device_error")
-        if device_error is not None:
-            raise UpdateFailed(
-                f"Device poll failed: {device_error}"
-            ) from device_error
-
-        prev.device_name = (
-            getattr(device, "display_name", None) or prev.device_name
+        # -- Start all API calls concurrently --------------------------------
+        device_task = asyncio.create_task(
+            self._client.get_device(self._device_id)
         )
-        props = device.properties
-        prev.locked = getattr(props, "locked", prev.locked)
-        prev.online = getattr(props, "online", prev.online)
 
-        model_obj = getattr(props, "model", None)
-        if model_obj:
-            mdname = getattr(model_obj, "display_name", None)
-            if mdname:
-                prev.model_display_name = mdname
+        codes_task: asyncio.Task[list[dict[str, Any]]] | None = None
+        events_task: asyncio.Task[list[dict[str, Any]]] | None = None
 
-        battery = getattr(props, "battery", None)
-        if battery:
-            level = getattr(battery, "level", None)
-            if level is not None:
-                prev.battery_level = round(level * 100, 1)
-            prev.battery_status = getattr(
-                battery, "status", prev.battery_status
-            )
-        else:
-            raw = getattr(props, "battery_level", None)
-            if raw is not None:
-                prev.battery_level = round(raw * 100, 1)
-
-        prev.door_open = getattr(props, "door_open", prev.door_open)
-
-        # -- Unpack access codes (non-fatal) -------------------------------
-        codes = result.get("codes")
-        if codes is not None:
-            prev.access_codes = {
-                c.access_code_id: c.name
-                or f"Unnamed Code ({c.access_code_id[:8]})"
-                for c in codes
-            }
-
-        # -- Unpack events (non-fatal) -------------------------------------
-        api_events = result.get("events")
-        if api_events is not None:
-            prev.events = self._merge_events(prev.events, api_events)
-            self._dispatch_new_events(api_events)
-
-        self._derive_summary(prev)
-        return prev
-
-    # -- API call wrappers -----------------------------------------------------
-
-    def _poll_all(self) -> dict[str, Any] | None:
-        """Run all Seam API calls in a single executor job.
-
-        Acquires ``_poll_lock`` to ensure only one executor thread
-        performs API calls at a time.  Returns ``None`` (without
-        blocking) if another thread already holds the lock — the async
-        caller treats this as "previous poll still running, skip".
-
-        Checks ``_abort`` between calls so the thread stops quickly
-        when the async side has timed out.  Reconciliation polls
-        (after a webhook) only fetch device state.  Access codes
-        and event history are independently throttled by time.
-        """
-        if not self._poll_lock.acquire(blocking=False):
-            return None
-        try:
-            # Clear _abort *after* acquiring the lock so we never
-            # accidentally clear a signal meant for a previous cycle.
-            self._abort.clear()
-            result: dict[str, Any] = {}
-            now = time.monotonic()
-            reconciling = self._is_reconciliation
-
-            # Device state (required — failure aborts the poll)
-            try:
-                result["device"] = self.seam.devices.get(
-                    device_id=self._device_id
-                )
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("Device poll failed: %s", err)
-                result["device_error"] = err
-                return result
-
-            # Reconciliation only needs device state — the webhook
-            # already delivered the event and access codes don't change.
-            if reconciling:
-                return result
-
-            # Abort check: async side timed out, stop making calls
-            if self._abort.is_set():
-                return result
-
-            # Access codes — throttled (rarely change)
+        if not reconciling:
             needs_codes = (
                 self._last_access_code_fetch == 0.0
                 or now - self._last_access_code_fetch
                 >= _ACCESS_CODE_REFRESH_SECONDS
             )
-            if needs_codes:
-                try:
-                    result["codes"] = self.seam.access_codes.list(
-                        device_id=self._device_id
-                    )
-                    self._last_access_code_fetch = now
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.debug("Access codes fetch failed: %s", err)
-
-            # Abort check
-            if self._abort.is_set():
-                return result
-
-            # Events — throttled when webhooks deliver them in real-time
             skip_events = (
                 self._webhook_active
                 and self._last_event_fetch != 0.0
                 and now - self._last_event_fetch < _EVENT_REFRESH_SECONDS
             )
+
+            if needs_codes:
+                codes_task = asyncio.create_task(
+                    self._client.list_access_codes(self._device_id)
+                )
             if not skip_events:
-                try:
-                    result["events"] = self._fetch_events()
-                    self._last_event_fetch = now
-                except Exception as err:  # noqa: BLE001
-                    _LOGGER.warning("Events fetch failed: %s", err)
+                events_task = asyncio.create_task(
+                    self._fetch_events_async()
+                )
 
-            return result
-        finally:
-            self._poll_lock.release()
+        # -- Device state (required — failure aborts the poll) ---------------
+        try:
+            device = await device_task
+        except Exception as err:
+            # Cancel in-flight optional tasks before raising
+            if codes_task:
+                codes_task.cancel()
+            if events_task:
+                events_task.cancel()
+            raise UpdateFailed(
+                f"Device poll failed: {err}"
+            ) from err
 
-    def _fetch_events(self) -> list[dict[str, Any]]:
-        """Fetch events via a single batch API call.
+        # Unpack device state
+        prev.device_name = (
+            device.get("display_name") or prev.device_name
+        )
+        props = device.get("properties", {})
+        prev.locked = props.get("locked", prev.locked)
+        prev.online = props.get("online", prev.online)
 
-        Uses the ``event_types`` (plural) parameter supported by
-        seam >= 0.24.0.  No fallback to individual per-type calls —
-        those would multiply executor thread occupation and are the
-        main cause of thread-pool starvation on constrained hardware.
-        If this call fails, the caller's blanket except skips events
-        for this cycle; they'll be picked up on the next poll.
-        """
+        model_obj = props.get("model")
+        if isinstance(model_obj, dict):
+            mdname = model_obj.get("display_name")
+            if mdname:
+                prev.model_display_name = mdname
+
+        battery = props.get("battery")
+        if isinstance(battery, dict):
+            level = battery.get("level")
+            if level is not None:
+                prev.battery_level = round(level * 100, 1)
+            bstatus = battery.get("status")
+            if bstatus is not None:
+                prev.battery_status = bstatus
+        else:
+            raw = props.get("battery_level")
+            if raw is not None:
+                prev.battery_level = round(raw * 100, 1)
+
+        prev.door_open = props.get("door_open", prev.door_open)
+
+        # Reconciliation only needs device state — the webhook
+        # already delivered the event and access codes don't change.
+        if reconciling:
+            self._derive_summary(prev)
+            return prev
+
+        # -- Access codes (non-fatal) ----------------------------------------
+        if codes_task:
+            try:
+                codes = await codes_task
+                prev.access_codes = {
+                    c["access_code_id"]: c.get("name")
+                    or f"Unnamed Code ({c['access_code_id'][:8]})"
+                    for c in codes
+                }
+                self._last_access_code_fetch = now
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Access codes fetch failed: %s", err)
+
+        # -- Events (non-fatal) ----------------------------------------------
+        if events_task:
+            try:
+                api_events = await events_task
+                prev.events = self._merge_events(prev.events, api_events)
+                self._dispatch_new_events(api_events)
+                self._last_event_fetch = now
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("Events fetch failed: %s", err)
+
+        self._derive_summary(prev)
+        return prev
+
+    # -- Async API call wrappers -----------------------------------------------
+
+    async def _fetch_events_async(self) -> list[dict[str, Any]]:
+        """Fetch and normalise events via the async API client."""
         since_dt = datetime.now(timezone.utc) - timedelta(
             days=_EVENT_LOOKBACK_DAYS
         )
@@ -562,7 +519,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
             *DEVICE_EVENT_TYPES,
         ]
 
-        raw = self.seam.events.list(
+        raw = await self._client.list_events(
             device_id=self._device_id,
             event_types=all_event_types,
             since=since_str,
@@ -572,22 +529,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         normalised: list[dict[str, Any]] = []
         for ev in raw:
             try:
-                normalised.append(
-                    self._normalise_event(
-                        {
-                            "event_id": getattr(ev, "event_id", None),
-                            "event_type": getattr(
-                                ev, "event_type", "unknown"
-                            ),
-                            "occurred_at": getattr(ev, "occurred_at", None),
-                            "created_at": getattr(ev, "created_at", None),
-                            "method": getattr(ev, "method", None),
-                            "access_code_id": getattr(
-                                ev, "access_code_id", None
-                            ),
-                        }
-                    )
-                )
+                normalised.append(self._normalise_event(ev))
             except Exception:  # noqa: BLE001
                 pass
         return normalised
