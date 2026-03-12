@@ -453,7 +453,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
             prev.device_name = (
                 device.get("display_name") or prev.device_name
             )
-            props = device.get("properties", {})
+            props = device.get("properties") or {}
             prev.locked = props.get("locked", prev.locked)
             prev.online = props.get("online", prev.online)
 

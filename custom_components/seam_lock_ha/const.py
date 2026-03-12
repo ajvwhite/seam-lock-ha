@@ -74,6 +74,7 @@ DEVICE_EVENT_TYPES: list[str] = [
     "device.connected",
     "device.disconnected",
     "device.low_battery",
+    "device.battery_status_changed",
 ]
 
 # Icon per Seam event type — used by the Activity sensor.
