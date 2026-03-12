@@ -146,7 +146,7 @@ class AsyncSeamClient:
     async def list_locks(self) -> list[dict[str, Any]]:
         """List all locks visible to the API key (used by config flow)."""
         data = await self._post("/locks/list")
-        return data.get("locks", [])
+        return data.get("devices", [])
 
 
 class SeamLockData:
@@ -397,14 +397,21 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
             self._is_reconciliation = False
 
     async def _async_poll(self) -> SeamLockData:
-        """Execute all API fetches and unpack results."""
+        """Execute all API fetches and unpack results.
+
+        A ``finally`` block ensures every task created here is cancelled
+        on *any* exit — normal return, device failure, or parent timeout.
+        This prevents orphaned tasks that would leak HTTP connections and
+        produce ``Task was destroyed but it is pending`` warnings.
+        """
         prev = self.data
         now = time.monotonic()
         reconciling = self._is_reconciliation
 
         # -- Start all API calls concurrently --------------------------------
         device_task = asyncio.create_task(
-            self._client.get_device(self._device_id)
+            self._client.get_device(self._device_id),
+            name="seam_poll_device",
         )
 
         codes_task: asyncio.Task[list[dict[str, Any]]] | None = None
@@ -424,86 +431,93 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
             if needs_codes:
                 codes_task = asyncio.create_task(
-                    self._client.list_access_codes(self._device_id)
+                    self._client.list_access_codes(self._device_id),
+                    name="seam_poll_codes",
                 )
             if not skip_events:
                 events_task = asyncio.create_task(
-                    self._fetch_events_async()
+                    self._fetch_events_async(),
+                    name="seam_poll_events",
                 )
 
-        # -- Device state (required — failure aborts the poll) ---------------
         try:
-            device = await device_task
-        except Exception as err:
-            # Cancel in-flight optional tasks before raising
+            # -- Device state (required — failure aborts) --------------------
+            try:
+                device = await device_task
+            except Exception as err:
+                raise UpdateFailed(
+                    f"Device poll failed: {err}"
+                ) from err
+
+            # Unpack device state
+            prev.device_name = (
+                device.get("display_name") or prev.device_name
+            )
+            props = device.get("properties", {})
+            prev.locked = props.get("locked", prev.locked)
+            prev.online = props.get("online", prev.online)
+
+            model_obj = props.get("model")
+            if isinstance(model_obj, dict):
+                mdname = model_obj.get("display_name")
+                if mdname:
+                    prev.model_display_name = mdname
+
+            battery = props.get("battery")
+            if isinstance(battery, dict):
+                level = battery.get("level")
+                if level is not None:
+                    prev.battery_level = round(level * 100, 1)
+                bstatus = battery.get("status")
+                if bstatus is not None:
+                    prev.battery_status = bstatus
+            else:
+                raw = props.get("battery_level")
+                if raw is not None:
+                    prev.battery_level = round(raw * 100, 1)
+
+            prev.door_open = props.get("door_open", prev.door_open)
+
+            # Reconciliation only needs device state — the webhook
+            # already delivered the event and access codes don't change.
+            if reconciling:
+                self._derive_summary(prev)
+                return prev
+
+            # -- Access codes (non-fatal) ------------------------------------
             if codes_task:
-                codes_task.cancel()
+                try:
+                    codes = await codes_task
+                    prev.access_codes = {
+                        c["access_code_id"]: c.get("name")
+                        or f"Unnamed Code ({c['access_code_id'][:8]})"
+                        for c in codes
+                    }
+                    self._last_access_code_fetch = now
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.debug("Access codes fetch failed: %s", err)
+
+            # -- Events (non-fatal) ------------------------------------------
             if events_task:
-                events_task.cancel()
-            raise UpdateFailed(
-                f"Device poll failed: {err}"
-            ) from err
+                try:
+                    api_events = await events_task
+                    prev.events = self._merge_events(
+                        prev.events, api_events
+                    )
+                    self._dispatch_new_events(api_events)
+                    self._last_event_fetch = now
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning("Events fetch failed: %s", err)
 
-        # Unpack device state
-        prev.device_name = (
-            device.get("display_name") or prev.device_name
-        )
-        props = device.get("properties", {})
-        prev.locked = props.get("locked", prev.locked)
-        prev.online = props.get("online", prev.online)
-
-        model_obj = props.get("model")
-        if isinstance(model_obj, dict):
-            mdname = model_obj.get("display_name")
-            if mdname:
-                prev.model_display_name = mdname
-
-        battery = props.get("battery")
-        if isinstance(battery, dict):
-            level = battery.get("level")
-            if level is not None:
-                prev.battery_level = round(level * 100, 1)
-            bstatus = battery.get("status")
-            if bstatus is not None:
-                prev.battery_status = bstatus
-        else:
-            raw = props.get("battery_level")
-            if raw is not None:
-                prev.battery_level = round(raw * 100, 1)
-
-        prev.door_open = props.get("door_open", prev.door_open)
-
-        # Reconciliation only needs device state — the webhook
-        # already delivered the event and access codes don't change.
-        if reconciling:
             self._derive_summary(prev)
             return prev
 
-        # -- Access codes (non-fatal) ----------------------------------------
-        if codes_task:
-            try:
-                codes = await codes_task
-                prev.access_codes = {
-                    c["access_code_id"]: c.get("name")
-                    or f"Unnamed Code ({c['access_code_id'][:8]})"
-                    for c in codes
-                }
-                self._last_access_code_fetch = now
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Access codes fetch failed: %s", err)
-
-        # -- Events (non-fatal) ----------------------------------------------
-        if events_task:
-            try:
-                api_events = await events_task
-                prev.events = self._merge_events(prev.events, api_events)
-                self._dispatch_new_events(api_events)
-                self._last_event_fetch = now
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("Events fetch failed: %s", err)
-
-        self._derive_summary(prev)
-        return prev
+        finally:
+            # Cancel any in-flight tasks on *any* exit (error, timeout,
+            # or normal return after reconciliation skipped optional tasks).
+            for task in (device_task, codes_task, events_task):
+                if task is not None and not task.done():
+                    task.cancel()
 
     # -- Async API call wrappers -----------------------------------------------
 
