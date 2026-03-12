@@ -233,6 +233,11 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         # Track which event IDs have been dispatched to listeners so
         # the polling path can detect genuinely new events.
         self._dispatched_event_ids: set[str] = set()
+        # Secondary dedup: (event_type, occurred_at) signatures.
+        # Catches the same physical event even if its event_id changes
+        # between webhook delivery and API poll (e.g. synthetic ID
+        # replaced by a real one, or Svix vs Seam ID mismatch).
+        self._dispatched_event_sigs: set[tuple[str, str]] = set()
         # Whether the initial seed of known event IDs has been done.
         # Prevents flooding the timeline with historical events on startup.
         self._dispatch_seeded: bool = False
@@ -268,6 +273,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         self._event_listeners.clear()
         self._event_id_cache.clear()
         self._dispatched_event_ids.clear()
+        self._dispatched_event_sigs.clear()
         self._dispatch_seeded = False
 
     # -- Webhook instant-update path -------------------------------------------
@@ -318,12 +324,21 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
         # Mark as dispatched so the polling path doesn't re-fire it
         self._dispatched_event_ids.add(eid)
-        # Cap the tracking set to avoid unbounded growth
+        evt_sig = (entry.get("event_type", ""), entry.get("occurred_at", ""))
+        if evt_sig[0] and evt_sig[1]:
+            self._dispatched_event_sigs.add(evt_sig)
+        # Cap the tracking sets to avoid unbounded growth
         if len(self._dispatched_event_ids) > _MAX_STORED_EVENTS * 2:
             self._dispatched_event_ids = {
                 e.get("event_id")
                 for e in self.data.events[:_MAX_STORED_EVENTS]
                 if e.get("event_id")
+            }
+        if len(self._dispatched_event_sigs) > _MAX_STORED_EVENTS * 2:
+            self._dispatched_event_sigs = {
+                (e.get("event_type", ""), e.get("occurred_at", ""))
+                for e in self.data.events[:_MAX_STORED_EVENTS]
+                if e.get("event_type") and e.get("occurred_at")
             }
 
         # Fire HA bus event for automations
@@ -556,11 +571,14 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
     ) -> None:
         """Dispatch events not yet seen to EventEntity listeners.
 
-        Only fires events whose event_id hasn't been dispatched before
-        (webhook or previous poll).  On the first call with active
-        listeners, seeds the tracking set from ALL known events (both
-        previously stored and just-fetched) without firing — avoids
-        flooding the timeline with historical events at startup.
+        Uses dual dedup: event_id AND (event_type, occurred_at) signature.
+        The signature layer catches the same physical event even when its
+        event_id differs between sources (e.g. synthetic ID from a webhook
+        later replaced by a real API-assigned ID, or vice-versa).
+
+        On the first call with active listeners, seeds both tracking sets
+        from ALL known events without firing — avoids flooding the timeline
+        with historical events at startup.
         """
         if not self._event_listeners:
             return
@@ -570,27 +588,52 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         # the caller).  This covers the case where a webhook arrived
         # between first poll and entity registration.
         if not self._dispatch_seeded:
-            self._dispatched_event_ids = {
-                e.get("event_id")
-                for e in self.data.events
-                if e.get("event_id")
-            }
+            for e in self.data.events:
+                eid = e.get("event_id")
+                if eid:
+                    self._dispatched_event_ids.add(eid)
+                etype = e.get("event_type", "")
+                occ = e.get("occurred_at", "")
+                if etype and occ:
+                    self._dispatched_event_sigs.add((etype, occ))
             self._dispatch_seeded = True
             return
 
         new_events: list[dict[str, Any]] = []
         for ev in api_events:
             eid = ev.get("event_id")
-            if eid and eid not in self._dispatched_event_ids:
-                new_events.append(ev)
-                self._dispatched_event_ids.add(eid)
+            etype = ev.get("event_type", "")
+            occ = ev.get("occurred_at", "")
+            sig = (etype, occ)
 
-        # Cap the tracking set
+            # Skip if already dispatched by event_id OR by signature
+            if eid and eid in self._dispatched_event_ids:
+                continue
+            if etype and occ and sig in self._dispatched_event_sigs:
+                # ID is new but the same physical event — track the
+                # new ID so future polls hit the fast path above.
+                if eid:
+                    self._dispatched_event_ids.add(eid)
+                continue
+
+            new_events.append(ev)
+            if eid:
+                self._dispatched_event_ids.add(eid)
+            if etype and occ:
+                self._dispatched_event_sigs.add(sig)
+
+        # Cap the tracking sets
         if len(self._dispatched_event_ids) > _MAX_STORED_EVENTS * 2:
             self._dispatched_event_ids = {
                 e.get("event_id")
                 for e in self.data.events[:_MAX_STORED_EVENTS]
                 if e.get("event_id")
+            }
+        if len(self._dispatched_event_sigs) > _MAX_STORED_EVENTS * 2:
+            self._dispatched_event_sigs = {
+                (e.get("event_type", ""), e.get("occurred_at", ""))
+                for e in self.data.events[:_MAX_STORED_EVENTS]
+                if e.get("event_type") and e.get("occurred_at")
             }
 
         # Dispatch newest first (api_events are already sorted desc)
