@@ -207,8 +207,12 @@ async def async_setup_entry(
         webhook_secret=webhook_secret,
         webhook_url=webhook_url,
     )
-    # Pre-warm the verifier (caches success or failure)
-    entry.runtime_data.get_verifier()
+    # Pre-warm the verifier off the event loop — the ``from seam import
+    # SeamWebhook`` triggers blocking I/O (SSL cert reads, listdir on
+    # site-packages, metadata parsing) that HA 2026.1+ detects and flags.
+    # Once imported, the module is cached so subsequent get_verifier()
+    # calls from the webhook handler return instantly.
+    await hass.async_add_executor_job(entry.runtime_data.get_verifier)
 
     if webhook_secret:
         pn_dismiss(hass, _pn_id(entry))
