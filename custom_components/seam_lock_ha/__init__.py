@@ -304,37 +304,26 @@ def _build_webhook_handler(entry_id: str):
                 headers = dict(request.headers)
                 body_str = raw_body.decode("utf-8")
 
-                def _verify() -> Any:
-                    return verifier.verify(body_str, headers)
+                def _verify() -> None:
+                    verifier.verify(body_str, headers)
 
-                verified_event = await hass.async_add_executor_job(
-                    _verify
-                )
-                payload = {
-                    "event_id": getattr(verified_event, "event_id", None),
-                    "event_type": getattr(
-                        verified_event, "event_type", None
-                    ),
-                    "occurred_at": getattr(
-                        verified_event, "occurred_at", None
-                    ),
-                    "created_at": getattr(
-                        verified_event, "created_at", None
-                    ),
-                    "device_id": getattr(
-                        verified_event, "device_id", None
-                    ),
-                    "method": getattr(verified_event, "method", None),
-                    "access_code_id": getattr(
-                        verified_event, "access_code_id", None
-                    ),
-                }
+                await hass.async_add_executor_job(_verify)
+                # Signature valid — continue with the original JSON
+                # payload parsed above.  The raw dict preserves all
+                # Seam event fields (method, access_code_id, etc.)
+                # that the Svix verified-event object may omit.
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("Webhook signature failed: %s", err)
                 return Response(status=401, text="Invalid signature")
         elif runtime.webhook_secret:
             # Secret configured but verifier init failed permanently
             return Response(status=500, text="Verifier error")
+
+        # Seam may wrap event data under an "event" key.
+        if "event_type" not in payload and isinstance(
+            payload.get("event"), dict
+        ):
+            payload = payload["event"]
 
         # -- Validate and dispatch ---------------------------------------------
         event_type = payload.get("event_type", "")

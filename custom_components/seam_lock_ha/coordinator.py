@@ -185,22 +185,6 @@ class SeamLockData:
         self.total_unlocks_today: int = 0
         self.access_codes: dict[str, str] = {}
 
-    def snapshot(self) -> SeamLockData:
-        """Return a shallow copy for atomic updates.
-
-        The poll path works on a snapshot so entities never observe
-        partially-updated state mid-poll.  Mutable containers (events,
-        access_codes) are shallow-copied so appends to the snapshot
-        don't mutate the live object.
-        """
-        copy = SeamLockData.__new__(SeamLockData)
-        for attr in self.__slots__:
-            setattr(copy, attr, getattr(self, attr))
-        # Shallow-copy mutable containers so mutations stay isolated
-        copy.events = list(self.events)
-        copy.access_codes = dict(self.access_codes)
-        return copy
-
 
 class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
     """Coordinate Seam API polling and webhook-delivered updates.
@@ -244,8 +228,6 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
         self.data = SeamLockData()
         self._event_listeners: list[callback] = []
-        # Persistent set of event IDs for O(1) webhook dedup.
-        self._event_id_cache: set[str] = set()
         # Track which event IDs have been dispatched to listeners so
         # the polling path can detect genuinely new events.
         self._dispatched_event_ids: set[str] = set()
@@ -287,7 +269,6 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
         # Drop listener references and caches
         self._event_listeners.clear()
-        self._event_id_cache.clear()
         self._dispatched_event_ids.clear()
         self._dispatched_event_sigs.clear()
         self._dispatch_seeded = False
@@ -310,7 +291,7 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
         # -- Dedup FIRST — skip all work for duplicate events ------------------
         eid = entry["event_id"]
         evt_sig = (entry.get("event_type", ""), entry.get("occurred_at", ""))
-        is_duplicate = eid in self._event_id_cache
+        is_duplicate = eid in self._dispatched_event_ids
         if not is_duplicate and evt_sig[0] and evt_sig[1]:
             is_duplicate = evt_sig in self._dispatched_event_sigs
 
@@ -337,16 +318,8 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
 
         # -- Track in caches ---------------------------------------------------
         self.data.events.insert(0, entry)
-        self._event_id_cache.add(eid)
         if len(self.data.events) > _MAX_STORED_EVENTS:
             del self.data.events[_MAX_STORED_EVENTS:]
-        # Prune cache when it grows too large
-        if len(self._event_id_cache) > _MAX_STORED_EVENTS * 2:
-            self._event_id_cache = {
-                e.get("event_id")
-                for e in self.data.events
-                if e.get("event_id")
-            }
 
         # Mark as dispatched so the polling path doesn't re-fire it
         self._dispatched_event_ids.add(eid)
@@ -439,14 +412,13 @@ class SeamLockCoordinator(DataUpdateCoordinator[SeamLockData]):
     async def _async_poll(self) -> SeamLockData:
         """Execute all API fetches and unpack results.
 
-        Works on a snapshot of the current data so entities never observe
-        partially-updated state mid-poll.  A ``finally`` block ensures
-        every task created here is cancelled on *any* exit — normal
-        return, device failure, or parent timeout.  This prevents
-        orphaned tasks that would leak HTTP connections and produce
-        ``Task was destroyed but it is pending`` warnings.
+        Works directly on ``self.data`` so webhook patches applied
+        between await points are preserved (no snapshot rollback).
+        A ``finally`` block ensures every task created here is
+        cancelled on *any* exit — normal return, device failure, or
+        parent timeout.
         """
-        prev = self.data.snapshot()
+        prev = self.data
         now = time.monotonic()
         reconciling = self._is_reconciliation
 
